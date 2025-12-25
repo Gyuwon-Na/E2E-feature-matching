@@ -35,85 +35,108 @@ def get_loftr_matches(img_src, img_tgt, device):
 # ==========================================
 # 📏 통합 비교 시각화 (LoFTR vs Ours)
 # ==========================================
-def visualize_with_error_heatmap(
-    img_src, img_tgt, ours_data, H_mat, threshold=5.0, conf_thresh=0.5
+def visualize_loftr_vs_ours(
+    img_src, img_tgt, ours_data, loftr_data, H_mat, threshold=10.0, num_show=150, conf_thresh=0.5
 ):
     """
-    1. 왼쪽: 매칭 결과 (Green/Red) - 이미지 B 밖으로 나가는 점은 제외
-    2. 오른쪽: 에러 히트맵 - 어디서 오차가 큰지 시각화
+    상단: LoFTR 매칭 결과
+    하단: Ours(Clifford + Phase4) 매칭 결과
+    🔥 검은색 영역 및 신뢰도 필터링 적용
     """
     H, W, _ = img_src.shape
+    canvas = np.hstack((img_src, img_tgt))
+    plt.figure(figsize=(20, 14))
+
+    # -------------------------------------------
+    # 1. 상단: LoFTR 매칭 결과
+    # -------------------------------------------
+    plt.subplot(2, 1, 1)
+    plt.imshow(canvas)
+    plt.title(f"Baseline: LoFTR Matching Results (Thresh={threshold}px)", fontsize=16, fontweight='bold')
+    plt.axis('off')
+
+    mkpts0, mkpts1 = loftr_data
+    if len(mkpts0) > 0:
+        # GT 계산 (이미지 B 내 유효성 검사)
+        src_pts_loftr = mkpts0.reshape(-1, 1, 2)
+        gt_pts_loftr = cv2.perspectiveTransform(src_pts_loftr, H_mat).reshape(-1, 2)
+        
+        # 필터링: 이미지 B 범위 안 + 검은색이 아닌 영역
+        mask_loftr = []
+        for i in range(len(gt_pts_loftr)):
+            gx, gy = int(gt_pts_loftr[i, 0]), int(gt_pts_loftr[i, 1])
+            if 0 <= gx < W and 0 <= gy < H and np.any(img_tgt[gy, gx] > 0):
+                mask_loftr.append(True)
+            else:
+                mask_loftr.append(False)
+        mask_loftr = np.array(mask_loftr)
+        
+        valid_idx_loftr = np.where(mask_loftr)[0]
+        if len(valid_idx_loftr) > 0:
+            show_idx = np.random.choice(valid_idx_loftr, min(num_show, len(valid_idx_loftr)), replace=False)
+            correct = 0
+            for i in valid_idx_loftr:
+                err = np.linalg.norm(mkpts1[i] - gt_pts_loftr[i])
+                if err < threshold: correct += 1
+                
+                if i in show_idx:
+                    color = 'lime' if err < threshold else 'red'
+                    plt.plot([mkpts0[i, 0], mkpts1[i, 0] + W], [mkpts0[i, 1], mkpts1[i, 1]], color=color, lw=1, alpha=0.6)
+                    plt.scatter(mkpts0[i, 0], mkpts0[i, 1], c=color, s=10)
+                    plt.scatter(mkpts1[i, 0] + W, mkpts1[i, 1], c=color, s=10)
+            
+            acc_loftr = (correct / len(valid_idx_loftr)) * 100
+            plt.text(10, 40, f"LoFTR Acc: {acc_loftr:.1f}% ({correct}/{len(valid_idx_loftr)} pts)", 
+                     color='white', backgroundcolor='black', fontsize=14, fontweight='bold')
+
+    # -------------------------------------------
+    # 2. 하단: Ours 매칭 결과
+    # -------------------------------------------
+    plt.subplot(2, 1, 2)
+    plt.imshow(canvas)
+    plt.title(f"Ours: Clifford + Phase4 Refinement (Conf > {conf_thresh})", fontsize=16, fontweight='bold')
+    plt.axis('off')
+
     init_verts, final_verts, confidences = ours_data
-    
-    # 1. 좌표 계산 및 변환
+    # 픽셀 좌표 복원
     src_pts_norm = init_verts.detach().cpu().numpy()
     src_x = (src_pts_norm[:, 0] + 1) * 0.5 * W
     src_y = (src_pts_norm[:, 1] + 1) * 0.5 * H
-    
     pred_pts_norm = final_verts.detach().cpu().numpy()
     pred_x = (pred_pts_norm[:, 0] + 1) * 0.5 * W
     pred_y = (pred_pts_norm[:, 1] + 1) * 0.5 * H
     
-    # 정답 위치 계산
+    # GT 계산 및 필터링
     src_pts_pixel = np.stack([src_x, src_y], axis=1).reshape(-1, 1, 2)
-    gt_pts = cv2.perspectiveTransform(src_pts_pixel, H_mat).reshape(-1, 2)
+    gt_pts_ours = cv2.perspectiveTransform(src_pts_pixel, H_mat).reshape(-1, 2)
     
-    # 2. 마스크 생성 (유효 영역 + 신뢰도)
-    mask_range = (gt_pts[:, 0] >= 0) & (gt_pts[:, 0] < W) & \
-                 (gt_pts[:, 1] >= 0) & (gt_pts[:, 1] < H)
-    mask_conf = confidences >= conf_thresh
-    final_mask = mask_range & mask_conf
+    mask_ours = []
+    for i in range(len(gt_pts_ours)):
+        gx, gy = int(gt_pts_ours[i, 0]), int(gt_pts_ours[i, 1])
+        # 조건: 이미지 범위 안 + 검은색 아님 + 신뢰도 통과
+        if 0 <= gx < W and 0 <= gy < H and np.any(img_tgt[gy, gx] > 0) and confidences[i] >= conf_thresh:
+            mask_ours.append(True)
+        else:
+            mask_ours.append(False)
+    mask_ours = np.array(mask_ours)
     
-    # 3. 에러 계산 (픽셀 거리 오차)
-    # 모든 점에 대해 계산하되, 마스크되지 않은 곳은 나중에 필터링
-    errors = np.linalg.norm(np.stack([pred_x, pred_y], axis=1) - gt_pts, axis=1)
-    
-    plt.figure(figsize=(20, 10))
-    
-    # --- [왼쪽] 매칭 결과 시각화 ---
-    plt.subplot(1, 2, 1)
-    canvas = np.hstack((img_src, img_tgt))
-    plt.imshow(canvas)
-    
-    valid_indices = np.where(final_mask)[0]
-    if len(valid_indices) > 0:
-        # 가독성을 위해 일부 점만 샘플링하여 그리기
-        show_idx = np.random.choice(valid_indices, min(150, len(valid_indices)), replace=False)
-        for i in show_idx:
-            color = 'lime' if errors[i] < threshold else 'red'
-            # 오타 수정: pred_py -> pred_y
-            plt.plot([src_x[i], pred_x[i] + W], [src_y[i], pred_y[i]], color=color, lw=0.8, alpha=0.6)
-            plt.scatter(src_x[i], src_y[i], c=color, s=5)
-            plt.scatter(pred_x[i] + W, pred_y[i], c=color, s=5)
+    valid_idx_ours = np.where(mask_ours)[0]
+    if len(valid_idx_ours) > 0:
+        show_idx_ours = np.random.choice(valid_idx_ours, min(num_show, len(valid_idx_ours)), replace=False)
+        correct_ours = 0
+        for i in valid_idx_ours:
+            err = np.linalg.norm(np.array([pred_x[i], pred_y[i]]) - gt_pts_ours[i])
+            if err < threshold: correct_ours += 1
             
-        acc = (errors[valid_indices] < threshold).mean() * 100
-        plt.text(10, 30, f"Acc: {acc:.1f}% ({len(valid_indices)} pts)", 
-                 color='white', backgroundcolor='black', fontsize=12)
-
-    plt.title(f"Matching Results (Green < {threshold}px)", fontsize=15)
-    plt.axis('off')
-
-    # --- [오른쪽] 에러 히트맵 (Error Heatmap) ---
-    plt.subplot(1, 2, 2)
-    
-    # 격자 해상도 복원 (예: 32x32)
-    grid_res = int(np.sqrt(len(errors)))
-    # 에러 맵 초기화 (유효하지 않은 곳은 에러 0으로 처리하거나 배경색 처리)
-    error_map_flat = np.zeros_like(errors)
-    error_map_flat[final_mask] = errors[final_mask]
-    
-    error_map = error_map_flat.reshape(grid_res, grid_res)
-    
-    # 히트맵을 원본 이미지 크기에 맞게 확대
-    # INTER_CUBIC을 써야 에러 분포가 부드럽게 보입니다.
-    error_heatmap = cv2.resize(error_map, (W, H), interpolation=cv2.INTER_CUBIC)
-    
-    plt.imshow(img_src)
-    # 'jet' 맵: 파란색(에러 낮음) -> 빨간색(에러 높음)
-    im = plt.imshow(error_heatmap, cmap='jet', alpha=0.5)
-    plt.colorbar(im, label='Pixel Error Distance')
-    plt.title("Error Heatmap (Red = High Error Area)", fontsize=15)
-    plt.axis('off')
+            if i in show_idx_ours:
+                color = 'lime' if err < threshold else 'red'
+                plt.plot([src_x[i], pred_x[i] + W], [src_y[i], pred_y[i]], color=color, lw=1, alpha=0.6)
+                plt.scatter(src_x[i], src_y[i], c=color, s=10)
+                plt.scatter(pred_x[i] + W, pred_y[i], c=color, s=10)
+                
+        acc_ours = (correct_ours / len(valid_idx_ours)) * 100
+        plt.text(10, 40, f"Ours Acc: {acc_ours:.1f}% ({correct_ours}/{len(valid_idx_ours)} pts)", 
+                 color='white', backgroundcolor='black', fontsize=14, fontweight='bold')
 
     plt.tight_layout()
     plt.show()
@@ -200,16 +223,18 @@ def run_evaluation(img_path, model_path, sam_path):
 
     # 7. 결과 비교 시각화
     print("🎨 Visualizing Comparison...")
-    visualize_with_error_heatmap(
+    visualize_loftr_vs_ours(
         img_rgb, img_tgt_rgb, 
-        ours_data=(refiner.mesh.initial_vertices, final_verts, confidences),  # 🔥 confidences 추가
+        ours_data=(refiner.mesh.initial_vertices, final_verts, confidences),
+        loftr_data=loftr_kpts,
         H_mat=H_mat,
-        threshold=15.0,
-        conf_thresh=0.5  # 🔥 신뢰도 임계값 설정
+        threshold=10.0, # 10픽셀 이내면 정답(Green)
+        num_show=200,    # 화면에 보여줄 선의 개수
+        conf_thresh=0.5  # 신뢰도 0.5 이상만 표시
     )
 
 if __name__ == "__main__":
-    TEST_IMAGE = "./img/val2017/000000579893.jpg" 
+    TEST_IMAGE = "./img/val2017/000000581482.jpg" 
     MODEL_PATH = "clifford_model_final.pth"
     SAM_PATH = "sam_vit_b_01ec64.pth"
     
