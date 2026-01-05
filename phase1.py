@@ -45,7 +45,7 @@ class MathGeometricPreprocessor:
         # 벡터의 크기(Magnitude) 계산
         # -> 나중에 Scalar 가중치로 쓰임 (Edge가 센 곳은 V1을 강하게 반영)
         mag = np.sqrt(gx**2 + gy**2)
-        edge_magnitude = self.normalize_minmax(mag)
+        edge_magnitude = np.power(self.normalize_minmax(mag), 0.7)
 
         # 단위 벡터(Unit Vector)로 정규화 ($e_1, e_2$ 성분)
         # 크기 정보는 edge_magnitude에 줬으니, 여기선 순수 '방향'만 남김
@@ -61,7 +61,7 @@ class MathGeometricPreprocessor:
         #      [ Ixy, Iyy ]]
         
         sigma = 1.0  # 적분 스케일 (주변을 얼마나 넓게 볼 것인가)
-        ksize = (5, 5)
+        ksize = (5,5)
         # 미분값의 제곱을 블러링(Gaussian)하여 '평균적인 경향성'을 파악
         Ixx = cv2.GaussianBlur(gx**2, ksize, sigma)
         Iyy = cv2.GaussianBlur(gy**2, ksize, sigma)
@@ -78,6 +78,7 @@ class MathGeometricPreprocessor:
         # sqrt((Ixx - Iyy)^2 + 4*Ixy^2) 공식은 (lambda1 - lambda2)와 비례함
         structure_energy = np.sqrt((Ixx - Iyy)**2 + 4 * Ixy**2)
         structure_energy = self.normalize_minmax(structure_energy)
+        structure_energy = np.power(structure_energy, 0.4)
 
         # =========================================================
         # [Part 4] Texture Flow Vector ($V_2$): "결을 따라가는 화살표"
@@ -93,7 +94,12 @@ class MathGeometricPreprocessor:
         # 이것이 바로 '결(Texture Flow)'의 방향 벡터임
         v2_x = -np.sin(angle)
         v2_y = np.cos(angle)
-
+        
+        # [중요] V2에 에너지(강도)를 곱해서 리턴합니다.
+        # 이렇게 해야 시각화할 때 '선명한 결'과 '노이즈'가 구분됩니다.
+        # (단위 벡터만 보내면 시각화 함수가 헷갈려 함)
+        v2_x = v2_x * structure_energy
+        v2_y = v2_y * structure_energy
         # ---------------------------------------------------------
         # [최종 반환]
         # Scalars (2개): [엣지세기, 구조에너지] -> 가중치(Magnitude)용
@@ -102,12 +108,43 @@ class MathGeometricPreprocessor:
         return edge_magnitude, structure_energy, v1_x, v1_y, v2_x, v2_y
 
     def get_edge_sdf(self, gray_img):
-        # [SDF 유지] 뼈대 추출 로직 그대로 사용
+        """
+        [Hybrid SDF Generator]
+        뼈대(Skeleton)의 선명함과 잠재장(Potential Field)의 부드러움을 융합합니다.
+        - Core: 얇고 진한 뼈대 (위치 정확성)
+        - Aura: 넓게 퍼지는 장 (탐색 범위 확대)
+        """
+        # 1. Canny Edge (기존 유지)
         edges = cv2.Canny(gray_img, 30, 100) 
+        
+        # 2. Distance Transform
+        # L1(Diamond)보다는 L2(Euclidean)가 물리적으로 더 부드러운 원형을 만듭니다.
+        # MPC나 벡터 필드에는 L2가 더 유리합니다.
         dist = cv2.distanceTransform(255 - edges, cv2.DIST_L2, 5)
+        
+        # 3. Base SDF (0.0 ~ 1.0)
+        # 엣지 위는 1.0, 멀어질수록 0.0
         max_val = dist.max() + 1e-6
-        sdf = 1.0 - (dist / max_val)
-        sdf = np.power(sdf, 2.0) 
+        base_sdf = 1.0 - (dist / max_val)
+        
+        # --- 4. Fusion Strategy (핵심) ---
+        
+        # (A) Skeleton Component (이미지 1 스타일)
+        # 거듭제곱을 높게(8~10) 주면, 1.0 근처만 살아남고 나머지는 급격히 0이 됨.
+        # 결과: 아주 얇고 날카로운 뼈대
+        skeleton = np.power(base_sdf, 8.0)
+        
+        # (B) Field Component (이미지 2 스타일)
+        # 거듭제곱을 낮게(1~2) 주면, 멀리까지 값이 살아있음.
+        # 결과: 부드러운 경사(Gradient)
+        field = np.power(base_sdf, 2.0)
+        
+        # (C) Hybrid Fusion
+        # 뼈대의 선명함을 유지하면서(Skeleton), 주변에 약한 장(Field)을 깐다.
+        # np.maximum을 쓰면 뼈대가 흐려지지 않고 그대로 유지됨!
+        # Field에 0.5를 곱해서 배경은 은은하게 만듦.
+        sdf = np.maximum(skeleton, field * 0.4)
+        
         return sdf
 
     def process_from_array(self, img_rgb):
@@ -150,9 +187,37 @@ class MathGeometricPreprocessor:
             'v_shape': v_shape        # [Global Context]: 전역 통계 -> (B, 6)
         }
 
-# --- 시각화 함수 업데이트 (코너 대신 Structure Energy 확인) ---
+# --- 벡터 시각화 헬퍼 함수 (필수 추가) ---
+def vector_to_rgb(vx, vy):
+    """
+    벡터 필드(vx, vy)를 HSV 색상 공간을 이용해 RGB 이미지로 변환합니다.
+    - 색상(Hue): 벡터의 방향 (어디를 가리키는지)
+    - 밝기(Value): 벡터의 크기 (얼마나 센지)
+    """
+    # 1. 극좌표계 변환 (Cartesian -> Polar)
+    magnitude, angle = cv2.cartToPolar(vx, vy)
+
+    # 2. HSV 이미지 생성
+    hsv = np.zeros((vx.shape[0], vx.shape[1], 3), dtype=np.uint8)
+    
+    # Hue: 각도 (0~360도 매핑) -> OpenCV Hue range is [0, 179]
+    hsv[..., 0] = angle * 180 / np.pi / 2
+    
+    # Saturation: 255 (색을 진하게)
+    hsv[..., 1] = 255
+    
+    # Value: 벡터 크기 (정규화)
+    # 노이즈 제거를 위해 최소/최대값으로 클리핑 후 스케일링
+    mag_norm = cv2.normalize(magnitude, None, 0, 255, cv2.NORM_MINMAX)
+    hsv[..., 2] = mag_norm
+
+    # 3. HSV -> RGB 변환
+    rgb = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)
+    return rgb
+
+# --- 메인 시각화 함수 업데이트 ---
 def visualize_phase1_outputs(img_path):
-    print(f"🔹 Analyzing Phase 1 (Dense Flow & Structure) for: {img_path}")
+    print(f"🔹 Analyzing Phase 1 (Dual-Vector & Structure) for: {img_path}")
     img = cv2.imread(img_path)
     if img is None: return
     img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
@@ -160,41 +225,73 @@ def visualize_phase1_outputs(img_path):
     preprocessor = MathGeometricPreprocessor()
     data = preprocessor.process_from_array(img_rgb)
     
+    # 1. Scalar Components (가중치 & 불변량)
     hsi = data['hsi']
-    texture = hsi[:,:,0]
-    struct_energy = hsi[:,:,1] # 구 Corner 자리
-    edge_mag = hsi[:,:,2]
-    sdf = data['sdf']
+    texture = hsi[:,:,0]       # S: 재질
+    struct_energy = hsi[:,:,1] # S: 결의 선명도 (구 Corner 대체)
+    edge_mag = hsi[:,:,2]      # S: 엣지 세기
+    sdf = data['sdf']          # S: 뼈대 에너지
     
-    plt.figure(figsize=(20, 10))
-    plt.suptitle("Phase 1: Flow-Based Vector Analysis (No Corner)", fontsize=22, fontweight='bold')
+    # 2. Vector Components (방향 정보) - 핵심 추가 부분!
+    vectors = data['gradient'] # (H, W, 4)
+    v1_x, v1_y = vectors[..., 0], vectors[..., 1] # Gradient Vector
+    v2_x, v2_y = vectors[..., 2], vectors[..., 3] # Texture Flow Vector
     
-    plt.subplot(2,3,1); plt.imshow(img_rgb); plt.title("1. Original")
-    plt.subplot(2,3,2); plt.imshow(texture, cmap='gray'); plt.title("2. Texture (Scalar)")
+    # 벡터를 RGB 이미지로 변환
+    rgb_v1 = vector_to_rgb(v1_x, v1_y)
+    rgb_v2 = vector_to_rgb(v2_x, v2_y)
     
-    # 여기가 핵심 변화!
-    plt.subplot(2,3,3); plt.imshow(struct_energy, cmap='inferno')
-    plt.title("3. Structure Energy (Flow Strength)\n*Replaces Corner*")
+    # 3. Plotting (2행 4열 레이아웃)
+    plt.figure(figsize=(24, 12))
+    plt.suptitle("Phase 1: Dual-Vector System Analysis (Flow & Gradient)", fontsize=22, fontweight='bold')
     
-    plt.subplot(2,3,4); plt.imshow(edge_mag, cmap='viridis'); plt.title("4. Edge Magnitude")
-    plt.subplot(2,3,5); plt.imshow(sdf, cmap='coolwarm'); plt.title("5. SDF (Skeleton)")
+    # --- Row 1: 기본 정보 & Scalar Maps ---
+    plt.subplot(2,4,1); plt.imshow(img_rgb); plt.title("1. Original Image")
+    plt.axis('off')
     
-    # Overlay 확인
-    plt.subplot(2,3,6)
-    # 텍스처(배경) + 구조(흐름) + SDF(뼈대)
-    importance = (texture * 0.3) + (struct_energy * 0.5) + (sdf * 0.2)
+    plt.subplot(2,4,2); plt.imshow(texture, cmap='gray'); plt.title("2. Texture (Invariant Scalar)")
+    plt.axis('off')
+    
+    plt.subplot(2,4,3); plt.imshow(edge_mag, cmap='viridis'); plt.title("3. Edge Magnitude (Force 1)")
+    plt.axis('off')
+    
+    plt.subplot(2,4,4); plt.imshow(struct_energy, cmap='inferno'); plt.title("4. Structure Energy (Force 2)\n(Corner Replacement)")
+    plt.axis('off')
+    
+    # --- Row 2: Vector Fields & Overlay ---
+    
+    # [5] Gradient Vector Visualization
+    plt.subplot(2,4,5); plt.imshow(rgb_v1)
+    plt.title("5. Gradient Vector ($V_1$)\n(Direction: Edge Normal)")
+    plt.xlabel("Color=Direction, Brightness=Magnitude")
+    plt.xticks([]), plt.yticks([])
+    
+    # [6] Texture Flow Vector Visualization (가장 중요한 부분)
+    plt.subplot(2,4,6); plt.imshow(rgb_v2)
+    plt.title("6. Texture Flow Vector ($V_2$)\n(Direction: Fur/Pattern Flow)")
+    plt.xlabel("Detects smooth curves & patterns")
+    plt.xticks([]), plt.yticks([])
+    
+    # [7] SDF (Potential)
+    plt.subplot(2,4,7); plt.imshow(sdf, cmap='coolwarm'); plt.title("7. SDF (Skeleton Potential)")
+    plt.axis('off')
+    
+    # [8] Scalar Importance Overlay
+    # 벡터는 그릴 수 없으므로, 스칼라 가중치들의 합을 오버레이로 확인
+    plt.subplot(2,4,8)
+    importance = (texture * 0.2) + (struct_energy * 0.5) + (edge_mag * 0.3)
     importance = (importance - importance.min()) / (importance.max() - importance.min() + 1e-6)
     
     plt.imshow(img_rgb)
-    plt.imshow(importance, cmap='jet', alpha=0.6)
-    plt.title("6. Final V-Field Visualization", fontsize=15, fontweight='bold', color='red')
+    plt.imshow(importance, cmap='jet', alpha=0.5)
+    plt.title("8. Scalar Attention Map\n(Where the model looks)", fontsize=14, fontweight='bold', color='red')
     plt.axis('off')
     
     plt.tight_layout()
     plt.show()
 
-# 실행 부
+# 실행 예시
 if __name__ == "__main__":
-    # 사용자 이미지 경로
+    # 이미지 경로를 본인의 환경에 맞게 수정하세요
     IMG_PATH = "./img/val2017/000000569972.jpg" 
     visualize_phase1_outputs(IMG_PATH)
