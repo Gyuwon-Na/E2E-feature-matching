@@ -36,6 +36,36 @@ class GeometricDataset(Dataset):
 
     def __len__(self):
         return len(self.img_paths)
+    
+    def normalize_affine_matrix(self,matrix_pixel, width, height):
+        """
+        OpenCV의 Pixel 단위 Affine 행렬을 PyTorch의 Normalized 좌표계([-1, 1]) 행렬로 변환
+        Args:
+            matrix_pixel: (2, 3) numpy array (OpenCV format)
+            width, height: Image dimensions
+        Returns:
+            matrix_norm: (2, 3) normalized matrix
+        """
+        # 1. 정규화 변환 행렬 (Pixel -> Normalized)
+        # x_norm = (x_pix / (width/2)) - 1
+        # Normalized Space로 가는 변환 행렬 N
+        N = np.array([
+            [2.0 / width, 0, -1],
+            [0, 2.0 / height, -1],
+            [0, 0, 1]
+        ])
+        
+        # 2. 역변환 행렬 (Normalized -> Pixel)
+        # Pixel Space로 돌아오는 변환 행렬 N_inv
+        N_inv = np.linalg.inv(N)
+        
+        # 3. 3x3 확장 (OpenCV 매트릭스는 2x3이므로)
+        M_pix_aug = np.vstack([matrix_pixel, [0, 0, 1]])
+        
+        # 4. 변환 공식: M_norm = N * M_pix * N_inv
+        M_norm_aug = N @ M_pix_aug @ N_inv
+        
+        return M_norm_aug[:2, :] # 다시 2x3으로 반환
 
     def __getitem__(self, idx):
         # 1. Load Image
@@ -65,8 +95,11 @@ class GeometricDataset(Dataset):
         # 3. Calculate W_GT (Alignment Matrix: A -> B)
         # 우리가 학습할 모델은 A를 B로 되돌리는 행렬을 예측해야 함.
         # 따라서 Warp 행렬 M의 역행렬이 정답(W_GT)임.
-        M_warp_aug = np.vstack([M_warp, [0, 0, 1]]) # 3x3 확장
-        W_gt_mat = np.linalg.inv(M_warp_aug)[:2, :] # 역행렬 계산 후 2x3 추출
+        M_warp_aug = np.vstack([M_warp, [0, 0, 1]]) 
+        W_gt_mat_pixel = np.linalg.inv(M_warp_aug)[:2, :] # 이건 픽셀 단위 (기존)
+
+        # [수정/추가] 픽셀 단위 행렬을 정규화된 행렬로 변환!
+        W_gt_mat_norm = self.normalize_affine_matrix(W_gt_mat_pixel, cols, rows)
 
         # 4. Phase 1 Preprocessing (CPU bottleneck 주의)
         # levels=4 추천 (L3:32x32 -> L2:64x64 -> L1:128x128 -> L0:256x256)
@@ -77,7 +110,7 @@ class GeometricDataset(Dataset):
         return {
             'pyramid_a': pyramid_a, # List of Dicts (Not Tensor yet)
             'pyramid_b': pyramid_b,
-            'w_gt': W_gt_mat.astype(np.float32) # (2, 3)
+            'w_gt': W_gt_mat_norm.astype(np.float32) # (2, 3)
         }
 
 def collate_fn_geometric(batch):
@@ -260,7 +293,7 @@ def train():
         transformer.train()
         
         epoch_loss = 0.0
-        pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS}")
+        pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS}", leave=False)
 
         for batch in pbar:
             # Data to GPU (Embedder 내부에서 Tensor 변환 수행)
