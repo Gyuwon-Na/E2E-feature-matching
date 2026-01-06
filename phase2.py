@@ -124,7 +124,8 @@ class CliffordComponentEmbedding(nn.Module):
         Returns:
             S (Tensor): (B, 64, H, W) - Cos 성분이 추가된 스칼라
             V (Tensor): (B, 64, 2, H, W) - 벡터 필드
-            B (Tensor): (B, 64, H, W) - Sin 성분으로 구성된 바이벡터
+            B (Tuple): ((B, 64, H, W), (B, 64, H, W), (B, 64, H, W)) 
+                       -> (Unit_Cos, Unit_Sin, Magnitude) 형태의 Rotor 패키지
         """
         if device is None:
             device = next(self.parameters()).device
@@ -166,18 +167,25 @@ class CliffordComponentEmbedding(nn.Module):
         cos_part = rotor_pair[:, :, 0, :, :] 
         sin_part = rotor_pair[:, :, 1, :, :]
         
-        # (3) Bivector ($B$) 할당
-        # Sin Part(회전 성분)를 그대로 Bivector로 사용합니다.
-        # Tanh를 쓰지 않는 이유: 아핀 변환의 '크기' 정보까지 살리기 위함 (사용자 의도 반영)
-        b_emb = sin_part 
+        # (3) 정규화 및 분리 (Normalization & Separation)
+        # Rotor Magnitude ($|R|$) 계산: Scale 성분 추출
+        rotor_mag = torch.sqrt(cos_part**2 + sin_part**2 + 1e-6) # 0 나누기 방지
+        
+        # Unit Rotor ($R/|R|$) 계산: 순수 회전 성분 추출
+        unit_cos = cos_part / rotor_mag
+        unit_sin = sin_part / rotor_mag
+        
+        # [Output B] Phase 3를 위해 분리된 성분들을 튜플로 패키징
+        b_emb = (unit_cos, unit_sin, rotor_mag)
         
         # (4) Scalar ($S$) 업데이트
-        # Cos Part(스케일/유사도 성분)를 기존 Scalar($S$)에 더해줍니다.
-        # 이로써 S는 단순 텍스처 정보뿐만 아니라, '얼마나 확대/축소되었는지'의 기하학적 정보도 가집니다.
+        # Cos Part(유사도 성분)를 기존 Scalar($S$)에 더해줍니다.
+        # 주의: 스칼라 업데이트에는 정규화 전의 'Raw Cosine(Scale 포함)'을 사용하여
+        # '얼마나 닮았고 얼마나 큰지'에 대한 정보를 S에 반영합니다.
         s_combined = torch.cat([s_emb, cos_part], dim=1) # (B, 128, H, W)
         s_emb = self.s_mixer(s_combined)                 # (B, 64, H, W)
 
-        # 5. 최종 멀티벡터 반환
+        # 5. 최종 멀티벡터 반환 (B는 이제 Tuple입니다)
         return s_emb, v_emb, b_emb
     
 class CliffordPyramidEmbedder(nn.Module):
@@ -196,7 +204,7 @@ class CliffordPyramidEmbedder(nn.Module):
         Args:
             pyramid_data_list (list): [Level0_Dict, Level1_Dict, ...]
         Returns:
-            list of tuples: [(S0, V0, B0), (S1, V1, B1), ...]
+            list of tuples: [(S0, V0, (uCos0, uSin0, Mag0)), ...]
         """
         pyramid_outputs = []
         
@@ -219,7 +227,7 @@ def visualize_clifford_pyramid(clifford_pyramid):
     Args:
         S: (B, 64, H, W)
         V: (B, 64, 2, H, W)
-        B: (B, 64, H, W)
+        B: Tuple (Unit_Cos, Unit_Sin, Magnitude) - 각 (B, 64, H, W)
     """
     levels = len(clifford_pyramid)
     plt.figure(figsize=(18, 4 * levels))
@@ -241,9 +249,12 @@ def visualize_clifford_pyramid(clifford_pyramid):
         v_vec = V[0].detach().cpu().numpy()
         v_mag = np.mean(np.sqrt(v_vec[:,0]**2 + v_vec[:,1]**2), axis=0)
 
-        # [Bivector Map] 64개 채널의 '회전 강도(절대값)'의 평균
-        # 음수 회전(-), 양수 회전(+) 모두 '회전이 있다'는 뜻이므로 절대값 취함
-        b_map = np.mean(np.abs(B[0].detach().cpu().numpy()), axis=0) 
+        # [Bivector Map] B가 Tuple로 변경되었으므로 Unpacking 필요
+        unit_cos, unit_sin, rotor_mag = B
+        
+        # 시각화에는 'Rotor Magnitude (Scale/Intensity)'를 사용
+        # 혹은 unit_sin(Rotation Amount)을 사용할 수도 있음. 여기선 Magnitude 사용.
+        b_map = np.mean(rotor_mag[0].detach().cpu().numpy(), axis=0)
         
         h, w = s_map.shape
         
@@ -266,7 +277,7 @@ def visualize_clifford_pyramid(clifford_pyramid):
         # Bivector
         plt.subplot(levels, 3, base_idx + 3)
         plt.imshow(b_map, cmap='magma')
-        if i==0: plt.title("Bivector Intensity ($B$)\n(Rotation/Curl)")
+        if i==0: plt.title("Bivector Intensity ($|R|$)\n(Rotation Scale)")
         plt.xticks([]), plt.yticks([])
 
     plt.tight_layout()
@@ -302,7 +313,11 @@ if __name__ == "__main__":
         
         # 3. Structure Check & Visualization
         for i, (S, V, B) in enumerate(clifford_pyramid):
-            print(f"   [Level {i}] Res: {S.shape[-2:]} | S:{S.shape} V:{V.shape} B:{B.shape}")
+            # [수정] B는 이제 Tuple이므로 B.shape 대신 내부 요소의 shape을 확인합니다.
+            # B = (Unit_Cos, Unit_Sin, Magnitude)
+            # 가장 중요한 Magnitude(인덱스 2)의 shape을 출력합니다.
+            rotor_mag_shape = B[2].shape 
+            print(f"   [Level {i}] Res: {S.shape[-2:]} | S:{S.shape} V:{V.shape} B(Mag):{rotor_mag_shape}")
             
         visualize_clifford_pyramid(clifford_pyramid)
 
