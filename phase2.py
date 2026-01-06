@@ -32,6 +32,7 @@ class CliffordComponentEmbedding(nn.Module):
         """
         super().__init__()
         self.hidden_dim = hidden_dim
+        self.s_mixer = nn.Conv2d(hidden_dim * 2, hidden_dim, kernel_size=1) # S값 추출 시 단순히 더하여 cos 정보가 텍스쳐 정보를 엉뚱하게 덮어씌우는 것을 방지
         
         # =====================================================================
         # 1. Scalar Embedding ($S_{in} \to S_{out}$)
@@ -115,7 +116,7 @@ class CliffordComponentEmbedding(nn.Module):
 
         return s_tensor, v_tensor, g_tensor
 
-    def forward(self, phase1_output, device=None):
+    def forward(self, phase1_item, device=None):
         """
         [Forward Pass]
         Numpy Dictionary -> Tensor 변환 -> Clifford Projection
@@ -129,7 +130,8 @@ class CliffordComponentEmbedding(nn.Module):
             device = next(self.parameters()).device
 
         # 1. 데이터 준비 (GPU 전송 포함)
-        s_in, v_in, g_in = self.to_tensor(phase1_output, device)
+        s_in, v_in, g_in = self.to_tensor(phase1_item, device)
+        batch, _, h, w = s_in.shape
 
         # 2. Scalar Embedding (S)
         # 물리적 스칼라들(재질, 에너지, SDF)을 고차원 특징으로 변환
@@ -147,7 +149,6 @@ class CliffordComponentEmbedding(nn.Module):
         # [핵심] 차원 재구성 (Reshape)
         # 128개 채널을 (64개 채널 x 2개 성분)으로 분리합니다.
         # 이렇게 해야 이후 연산에서 '벡터로서의 기하학적 성질'이 유지됩니다.
-        batch, _, h, w = v_flat.shape
         v_emb = v_flat.view(batch, self.hidden_dim, 2, h, w)
 
         # =====================================================================
@@ -173,13 +174,43 @@ class CliffordComponentEmbedding(nn.Module):
         # (4) Scalar ($S$) 업데이트
         # Cos Part(스케일/유사도 성분)를 기존 Scalar($S$)에 더해줍니다.
         # 이로써 S는 단순 텍스처 정보뿐만 아니라, '얼마나 확대/축소되었는지'의 기하학적 정보도 가집니다.
-        s_emb = s_emb + cos_part
+        s_combined = torch.cat([s_emb, cos_part], dim=1) # (B, 128, H, W)
+        s_emb = self.s_mixer(s_combined)                 # (B, 64, H, W)
 
         # 5. 최종 멀티벡터 반환
         return s_emb, v_emb, b_emb
     
+class CliffordPyramidEmbedder(nn.Module):
+    """
+    [Phase 2 Main Wrapper]
+    Phase 1에서 온 '피라미드 리스트'를 받아서,
+    Core Engine(Weights Shared)을 사용해 모든 레벨을 처리합니다.
+    """
+    def __init__(self, hidden_dim=64):
+        super().__init__()
+        # 하나의 Core 모듈을 모든 스케일에서 재사용 (Weight Sharing)
+        self.core = CliffordComponentEmbedding(hidden_dim)
+        
+    def forward(self, pyramid_data_list, device=None):
+        """
+        Args:
+            pyramid_data_list (list): [Level0_Dict, Level1_Dict, ...]
+        Returns:
+            list of tuples: [(S0, V0, B0), (S1, V1, B1), ...]
+        """
+        pyramid_outputs = []
+        
+        # 리스트 순회 (Global to Fine or Fine to Global)
+        for level_data in pyramid_data_list:
+            # 동일한 물리 법칙(Core) 적용
+            s, v, b = self.core(level_data, device)
+            pyramid_outputs.append((s, v, b))
+            
+        return pyramid_outputs
 
-def visualize_embedding(S, V, B):
+
+# --- 시각화 함수 (피라미드 전체 시각화) ---
+def visualize_clifford_pyramid(clifford_pyramid):
     """
     [Phase 2 Visualization]
     고차원(64채널) 클리포드 임베딩을 시각화합니다.
@@ -190,53 +221,54 @@ def visualize_embedding(S, V, B):
         V: (B, 64, 2, H, W)
         B: (B, 64, H, W)
     """
-    # 1. Tensor -> Numpy & 배치 차원 제거
-    # (64, H, W) 형태로 가져옴
-    s_map = S[0].detach().cpu().numpy()
-    v_map = V[0].detach().cpu().numpy() # (64, 2, H, W)
-    b_map = B[0].detach().cpu().numpy()
+    levels = len(clifford_pyramid)
+    plt.figure(figsize=(18, 4 * levels))
+    plt.suptitle("Phase 2: Multi-Scale Clifford Embedding (S, V, B)", fontsize=20, fontweight='bold')
     
-    # 2. 정보 압축 (Aggregation)
+    for i, (S, V, B) in enumerate(clifford_pyramid):
+        # 1. Tensor -> Numpy & 배치 차원 제거
+        # (64, H, W) 형태로 가져옴
+
+        # 2. 정보 압축 (Aggregation)
     
-    # [Scalar Map] 64개 채널의 평균 활성도
-    # (64, H, W) -> (H, W)
-    s_vis = np.mean(s_map, axis=0)
-    
-    # [Vector Map] 64개 벡터들의 '크기(Magnitude)'의 평균
-    # 먼저 각 채널별 벡터 크기 계산: sqrt(x^2 + y^2)
-    v_mag = np.sqrt(v_map[:, 0, :, :]**2 + v_map[:, 1, :, :]**2)
-    # 그 다음 채널 평균
-    v_vis = np.mean(v_mag, axis=0)
-    
-    # [Bivector Map] 64개 채널의 '회전 강도(절대값)'의 평균
-    # 음수 회전(-), 양수 회전(+) 모두 '회전이 있다'는 뜻이므로 절대값 취함
-    b_vis = np.mean(np.abs(b_map), axis=0)
-    
-    # 3. 시각화 (Plotting)
-    plt.figure(figsize=(18, 5))
-    plt.suptitle(f"Phase 2: Clifford Embedding Analysis (Hidden Dim: {s_map.shape[0]})", fontsize=16, fontweight='bold')
-    
-    # Scalar Embedding
-    plt.subplot(1, 3, 1)
-    plt.imshow(s_vis, cmap='inferno')
-    plt.title("1. Scalar Activation ($S_{emb}$)\n(Mean intensity of features)")
-    plt.colorbar()
-    plt.axis('off')
-    
-    # Vector Embedding
-    plt.subplot(1, 3, 2)
-    plt.imshow(v_vis, cmap='viridis')
-    plt.title("2. Vector Magnitude ($V_{emb}$)\n(Mean strength of directional forces)")
-    plt.colorbar()
-    plt.axis('off')
-    
-    # Bivector Embedding (New!)
-    plt.subplot(1, 3, 3)
-    plt.imshow(b_vis, cmap='magma')
-    plt.title("3. Bivector Intensity ($B_{emb}$)\n(Detected Rotations/Curls)")
-    plt.colorbar()
-    plt.axis('off')
-    
+        # [Scalar Map] 64개 채널의 평균 활성도
+        # (64, H, W) -> (H, W)
+        s_map = S[0].detach().cpu().numpy().mean(axis=0)          
+
+        # [Vector Map] 64개 벡터들의 '크기(Magnitude)'의 평균
+        # 먼저 각 채널별 벡터 크기 계산: sqrt(x^2 + y^2)
+        # 그 다음 채널 평균
+        v_vec = V[0].detach().cpu().numpy()
+        v_mag = np.mean(np.sqrt(v_vec[:,0]**2 + v_vec[:,1]**2), axis=0)
+
+        # [Bivector Map] 64개 채널의 '회전 강도(절대값)'의 평균
+        # 음수 회전(-), 양수 회전(+) 모두 '회전이 있다'는 뜻이므로 절대값 취함
+        b_map = np.mean(np.abs(B[0].detach().cpu().numpy()), axis=0) 
+        
+        h, w = s_map.shape
+        
+        # Plotting
+        base_idx = i * 3
+        
+        # Scalar
+        plt.subplot(levels, 3, base_idx + 1)
+        plt.imshow(s_map, cmap='inferno')
+        plt.ylabel(f"Level {i}\n({h}x{w})", fontsize=14, fontweight='bold')
+        if i==0: plt.title("Scalar Energy ($S$)\n(Texture + Similarity)")
+        plt.xticks([]), plt.yticks([])
+        
+        # Vector
+        plt.subplot(levels, 3, base_idx + 2)
+        plt.imshow(v_mag, cmap='viridis')
+        if i==0: plt.title("Vector Magnitude ($V$)\n(Directional Force)")
+        plt.xticks([]), plt.yticks([])
+        
+        # Bivector
+        plt.subplot(levels, 3, base_idx + 3)
+        plt.imshow(b_map, cmap='magma')
+        if i==0: plt.title("Bivector Intensity ($B$)\n(Rotation/Curl)")
+        plt.xticks([]), plt.yticks([])
+
     plt.tight_layout()
     plt.show()
 
@@ -244,52 +276,35 @@ def visualize_embedding(S, V, B):
 # 실행 및 검증 코드
 # =============================================================================
 if __name__ == "__main__":
-    # GPU 설정
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Phase 2 Initialized on Device: {device}")
+    print(f"Phase 2 Running on: {device}")
 
-    # 1. Phase 1 실행 (전처리)
-    # 이미지 경로 설정 (사용자 환경에 맞게 수정)
-    IMG_PATH = "./img/val2017/000000569972.jpg" 
+    # 1. Load & Phase 1 (Pyramid Extraction)
+    IMG_PATH = "./img/val2017/000000569972.jpg" # 이미지 경로
+    img = cv2.imread(IMG_PATH)
     
-    # 이미지 로드
-    img = torch.from_numpy(cv2.imread(IMG_PATH)).numpy() # Dummy load ensure cv2
-    if img is None:
-        print("이미지를 찾을 수 없습니다. 경로를 확인하세요.")
-        exit()
-    
-    img_rgb = cv2.cvtColor(cv2.imread(IMG_PATH), cv2.COLOR_BGR2RGB)
+    if img is not None:
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        
+        # Phase 1: Create 4-level pyramid (Level 0 ~ 3)
+        preprocessor = MathGeometricPreprocessor()
+        pyramid_raw = preprocessor.process_pyramid(img_rgb, levels=6)
+        print(f"Phase 1 Complete. Scales generated: {len(pyramid_raw)}")
 
-    # Phase 1 Preprocessor 호출
-    preprocessor = MathGeometricPreprocessor()
-    phase1_data = preprocessor.process_from_array(img_rgb)
-    
-    print("\nPhase 1 Output Keys:", phase1_data.keys())
-    print(f"   - HSI Shape: {phase1_data['hsi'].shape}")       # (H, W, 3)
-    print(f"   - Grad Shape: {phase1_data['gradient'].shape}") # (H, W, 4)
-    print(f"   - SDF Shape: {phase1_data['sdf'].shape}")       # (H, W)
+        # 2. Phase 2 (Pyramid Embedding)
+        embedder = CliffordPyramidEmbedder(hidden_dim=64).to(device)
+        
+        with torch.no_grad():
+            # 리스트 전체를 넘기면 내부에서 순회하며 처리
+            clifford_pyramid = embedder(pyramid_raw, device)
+            
+        print(f"Phase 2 Complete. Pyramid Embeddings Created: {len(clifford_pyramid)}")
+        
+        # 3. Structure Check & Visualization
+        for i, (S, V, B) in enumerate(clifford_pyramid):
+            print(f"   [Level {i}] Res: {S.shape[-2:]} | S:{S.shape} V:{V.shape} B:{B.shape}")
+            
+        visualize_clifford_pyramid(clifford_pyramid)
 
-    # 2. Phase 2 실행 (임베딩)
-    # 모델 초기화 및 GPU 이동
-    clifford_embedder = CliffordComponentEmbedding(hidden_dim=64).to(device)
-    
-    # Forward Pass (Numpy dict를 넣으면 알아서 Tensor 변환 후 처리)
-    with torch.no_grad(): # 추론 모드 (메모리 절약)
-        S, V, B = clifford_embedder(phase1_data, device)
-
-    # 3. 결과 확인
-    print("\nPhase 2 Embedding Complete (Clifford Multi-vector Created)")
-    print("-" * 50)
-    print(f"Scalar Part ($S$):   {S.shape}")     
-    # Expected: (1, 64, H, W) -> 텍스처와 에너지 정보가 융합됨
-    
-    print(f"Vector Part ($V$):   {V.shape}")     
-    # Expected: (1, 64, 2, H, W) -> [Gradient + Flow]가 섞여서 64개의 기하학적 벡터 생성
-    # 마지막 차원 2는 (x, y) 성분을 의미함
-    
-    print(f"Bivector Part ($B$): {B.shape}")     
-    # Expected: (1, 64, H, W) -> 벡터들의 상호작용으로 생성된 회전 정보
-    print("-" * 50)
-    
-    visualize_embedding(S, V, B)
-    print("이 (S, V, B) 튜플이 이제 Clifford Convolution Layer의 입력으로 들어갑니다.")
+    else:
+        print("Image Not Found.")

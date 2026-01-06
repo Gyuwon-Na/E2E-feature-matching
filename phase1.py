@@ -7,7 +7,7 @@ class MathGeometricPreprocessor:
         self.device = device
         # [Scalar Part] 조명 불변성 (유지)
         self.clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8)) 
-        print("📐 Mathematical Geometry Preprocessor V_Final (Dense Flow & Structure).")
+        print("Phase 1 Preprocessor Initialized. (Physical Raw Data Extraction)")
 
     def normalize_minmax(self, img_data):
         img_min = img_data.min()
@@ -147,7 +147,7 @@ class MathGeometricPreprocessor:
         
         return sdf
 
-    def process_from_array(self, img_rgb):
+    def _extract_raw_features(self, img_rgb):
         gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
         
         # 1. Texture (Scalar S) - 유지
@@ -181,11 +181,39 @@ class MathGeometricPreprocessor:
         ], dtype=np.float32)
 
         return {
+            'rgb': img_rgb,                # [Original Image]: 원본 이미지 -> (B, 3, H, W)
             'hsi': hsi_replacement,   # [Scalar Bundle]: 텍스처, 구조세기, 엣지세기 -> (B, 3, H, W)
             'sdf': sdf_map,           # [Potential Field]: 뼈대 에너지 -> (B, 1, H, W)
             'gradient': vector_field, # [Vector Core]: 진짜 방향 정보 (dx, dy, fx, fy) ->(B, H, W, 4) **핵심**
             'v_shape': v_shape        # [Global Context]: 전역 통계 -> (B, 6)
         }
+    
+    def process_pyramid(self, img_rgb, levels=6):
+        """
+        [Main Pipeline]
+        이미지 피라미드를 생성하고(1 ~ 1/32), 각 레벨별 물리량을 추출합니다.
+        
+        Returns:
+            list of dicts: [Level0_Data, Level1_Data, ..., Level5_Data]
+        """
+        pyramid_data = []
+        current_img = img_rgb.copy()
+        
+        print(f"Processing Pyramid (Levels={levels})...")
+        
+        for i in range(levels):
+            # 1. 현재 스케일 특징 추출
+            features = self._extract_raw_features(current_img)
+            features['level_index'] = i
+            features['resolution'] = current_img.shape[:2]
+            pyramid_data.append(features)
+            
+            # 2. 다음 스케일을 위한 다운샘플링 (Gaussian Pyramid)
+            # cv2.pyrDown은 가우시안 블러 후 해상도를 1/2로 줄이므로 앨리어싱 방지에 탁월
+            if i < levels - 1:
+                current_img = cv2.pyrDown(current_img)
+                
+        return pyramid_data
 
 # --- 벡터 시각화 헬퍼 함수 (필수 추가) ---
 def vector_to_rgb(vx, vy):
@@ -216,82 +244,111 @@ def vector_to_rgb(vx, vy):
     return rgb
 
 # --- 메인 시각화 함수 업데이트 ---
-def visualize_phase1_outputs(img_path):
-    print(f"🔹 Analyzing Phase 1 (Dual-Vector & Structure) for: {img_path}")
-    img = cv2.imread(img_path)
-    if img is None: return
-    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+def visualize_pyramid_detailed(pyramid_results):
+    levels = len(pyramid_results)
+    cols = 8 # 보여줄 항목 수
     
-    preprocessor = MathGeometricPreprocessor()
-    data = preprocessor.process_from_array(img_rgb)
+    # Figure 높이를 레벨 수에 비례하게 설정 (한 레벨당 높이 3인치)
+    plt.figure(figsize=(24, 3.5 * levels))
+    plt.suptitle("Phase 1: Multi-Scale Geometric Pyramid Analysis", fontsize=24, fontweight='bold', y=0.99)
     
-    # 1. Scalar Components (가중치 & 불변량)
-    hsi = data['hsi']
-    texture = hsi[:,:,0]       # S: 재질
-    struct_energy = hsi[:,:,1] # S: 결의 선명도 (구 Corner 대체)
-    edge_mag = hsi[:,:,2]      # S: 엣지 세기
-    sdf = data['sdf']          # S: 뼈대 에너지
-    
-    # 2. Vector Components (방향 정보) - 핵심 추가 부분!
-    vectors = data['gradient'] # (H, W, 4)
-    v1_x, v1_y = vectors[..., 0], vectors[..., 1] # Gradient Vector
-    v2_x, v2_y = vectors[..., 2], vectors[..., 3] # Texture Flow Vector
-    
-    # 벡터를 RGB 이미지로 변환
-    rgb_v1 = vector_to_rgb(v1_x, v1_y)
-    rgb_v2 = vector_to_rgb(v2_x, v2_y)
-    
-    # 3. Plotting (2행 4열 레이아웃)
-    plt.figure(figsize=(24, 12))
-    plt.suptitle("Phase 1: Dual-Vector System Analysis (Flow & Gradient)", fontsize=22, fontweight='bold')
-    
-    # --- Row 1: 기본 정보 & Scalar Maps ---
-    plt.subplot(2,4,1); plt.imshow(img_rgb); plt.title("1. Original Image")
-    plt.axis('off')
-    
-    plt.subplot(2,4,2); plt.imshow(texture, cmap='gray'); plt.title("2. Texture (Invariant Scalar)")
-    plt.axis('off')
-    
-    plt.subplot(2,4,3); plt.imshow(edge_mag, cmap='viridis'); plt.title("3. Edge Magnitude (Force 1)")
-    plt.axis('off')
-    
-    plt.subplot(2,4,4); plt.imshow(struct_energy, cmap='inferno'); plt.title("4. Structure Energy (Force 2)\n(Corner Replacement)")
-    plt.axis('off')
-    
-    # --- Row 2: Vector Fields & Overlay ---
-    
-    # [5] Gradient Vector Visualization
-    plt.subplot(2,4,5); plt.imshow(rgb_v1)
-    plt.title("5. Gradient Vector ($V_1$)\n(Direction: Edge Normal)")
-    plt.xlabel("Color=Direction, Brightness=Magnitude")
-    plt.xticks([]), plt.yticks([])
-    
-    # [6] Texture Flow Vector Visualization (가장 중요한 부분)
-    plt.subplot(2,4,6); plt.imshow(rgb_v2)
-    plt.title("6. Texture Flow Vector ($V_2$)\n(Direction: Fur/Pattern Flow)")
-    plt.xlabel("Detects smooth curves & patterns")
-    plt.xticks([]), plt.yticks([])
-    
-    # [7] SDF (Potential)
-    plt.subplot(2,4,7); plt.imshow(sdf, cmap='coolwarm'); plt.title("7. SDF (Skeleton Potential)")
-    plt.axis('off')
-    
-    # [8] Scalar Importance Overlay
-    # 벡터는 그릴 수 없으므로, 스칼라 가중치들의 합을 오버레이로 확인
-    plt.subplot(2,4,8)
-    importance = (texture * 0.2) + (struct_energy * 0.5) + (edge_mag * 0.3)
-    importance = (importance - importance.min()) / (importance.max() - importance.min() + 1e-6)
-    
-    plt.imshow(img_rgb)
-    plt.imshow(importance, cmap='jet', alpha=0.5)
-    plt.title("8. Scalar Attention Map\n(Where the model looks)", fontsize=14, fontweight='bold', color='red')
-    plt.axis('off')
-    
+    for i, data in enumerate(pyramid_results):
+        h, w = data['resolution']
+        
+        # --- 데이터 추출 ---
+        # 1. Image
+        img_rgb = data['rgb']
+
+        # 2. Scalars
+        hsi = data['hsi']
+        texture = hsi[:,:,0]       # Texture
+        struct_energy = hsi[:,:,1] # Structure Energy
+        edge_mag = hsi[:,:,2]      # Edge Magnitude
+        sdf = data['sdf']          # SDF
+        
+        # 3. Vectors
+        vec = data['gradient']
+        v1_x, v1_y = vec[..., 0], vec[..., 1] # Gradient
+        v2_x, v2_y = vec[..., 2], vec[..., 3] # Flow
+        
+        # 4. Vector to RGB 변환
+        rgb_v1 = vector_to_rgb(v1_x, v1_y)
+        rgb_v2 = vector_to_rgb(v2_x, v2_y)
+        
+        # 5. Attention Map 생성
+        importance = (texture * 0.2) + (struct_energy * 0.5) + (edge_mag * 0.3)
+        importance = (importance - importance.min()) / (importance.max() - importance.min() + 1e-6)
+
+        # --- Plotting (Row: Level, Col: Features) ---
+        base_idx = i * cols
+        
+        # Column 1: Original Image
+        plt.subplot(levels, cols, base_idx + 1)
+        plt.imshow(img_rgb)
+        plt.ylabel(f"Level {i}\n({h}x{w})", fontsize=14, fontweight='bold')
+        if i == 0: plt.title("1. Original", fontsize=12, fontweight='bold')
+        plt.xticks([]), plt.yticks([])
+        
+        # Column 2: Texture
+        plt.subplot(levels, cols, base_idx + 2)
+        plt.imshow(texture, cmap='gray')
+        if i == 0: plt.title("2. Texture (S)", fontsize=12, fontweight='bold')
+        plt.axis('off')
+
+        # Column 3: Edge Magnitude
+        plt.subplot(levels, cols, base_idx + 3)
+        plt.imshow(edge_mag, cmap='viridis')
+        if i == 0: plt.title("3. Edge Mag (S)", fontsize=12, fontweight='bold')
+        plt.axis('off')
+
+        # Column 4: Structure Energy
+        plt.subplot(levels, cols, base_idx + 4)
+        plt.imshow(struct_energy, cmap='inferno')
+        if i == 0: plt.title("4. Struct Energy (S)", fontsize=12, fontweight='bold')
+        plt.axis('off')
+
+        # Column 5: Gradient Vector (V1)
+        plt.subplot(levels, cols, base_idx + 5)
+        plt.imshow(rgb_v1)
+        if i == 0: plt.title("5. Gradient Vec (V1)", fontsize=12, fontweight='bold')
+        plt.axis('off')
+
+        # Column 6: Texture Flow Vector (V2)
+        plt.subplot(levels, cols, base_idx + 6)
+        plt.imshow(rgb_v2)
+        if i == 0: plt.title("6. Flow Vec (V2)", fontsize=12, fontweight='bold')
+        plt.axis('off')
+
+        # Column 7: SDF
+        plt.subplot(levels, cols, base_idx + 7)
+        plt.imshow(sdf, cmap='coolwarm')
+        if i == 0: plt.title("7. SDF Potential (S)", fontsize=12, fontweight='bold')
+        plt.axis('off')
+
+        # Column 8: Attention Map
+        plt.subplot(levels, cols, base_idx + 8)
+        plt.imshow(img_rgb)
+        plt.imshow(importance, cmap='jet', alpha=0.5)
+        if i == 0: plt.title("8. Attention Map", fontsize=12, fontweight='bold', color='red')
+        plt.axis('off')
+
     plt.tight_layout()
     plt.show()
 
-# 실행 예시
+# --- 실행 ---
 if __name__ == "__main__":
-    # 이미지 경로를 본인의 환경에 맞게 수정하세요
-    IMG_PATH = "./img/val2017/000000569972.jpg" 
-    visualize_phase1_outputs(IMG_PATH)
+    IMG_PATH = "./img/val2017/000000569972.jpg"  # 이미지 경로 수정 필요
+    img = cv2.imread(IMG_PATH)
+    
+    if img is not None:
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        
+        processor = MathGeometricPreprocessor()
+        
+        # 4단계 피라미드 생성 (Level 0 ~ Level 3)
+        pyramid_results = processor.process_pyramid(img_rgb, levels=6)
+        
+        # 상세 시각화 실행
+        visualize_pyramid_detailed(pyramid_results)
+    else:
+        print("Image Not Found!")
