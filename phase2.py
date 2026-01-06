@@ -90,29 +90,38 @@ class CliffordComponentEmbedding(nn.Module):
 
     def to_tensor(self, data_dict, device):
         """
-        [Helper] Numpy 데이터를 GPU Tensor로 변환하고 차원을 맞춥니다.
-        HWC(OpenCV) -> CHW(PyTorch) -> Batch 추가 -> CUDA 전송
+        [Helper - 수정됨] Numpy 데이터를 GPU Tensor로 변환하고 차원을 맞춥니다.
+        단일 이미지(HWC)와 배치 이미지(BHWC)를 모두 처리할 수 있도록 개선되었습니다.
         """
         # 1. Scalar Group (HSI + SDF) 합치기
-        # hsi: (H, W, 3), sdf: (H, W)
-        hsi = data_dict['hsi']
-        sdf = data_dict['sdf'][..., np.newaxis] # (H, W, 1)로 확장
+        hsi = data_dict['hsi'] # (H, W, 3) 또는 (B, H, W, 3)
+        sdf = data_dict['sdf'] # (H, W) 또는 (B, H, W)
         
-        # (H, W, 4) 형태로 결합
-        scalars_np = np.concatenate([hsi, sdf], axis=-1)
+        # 배치 차원 존재 여부 확인 (ndim이 4면 배치 포함)
+        has_batch = (hsi.ndim == 4)
         
-        # 2. Vector Group
-        # gradient: (H, W, 4) -> 이미 dx, dy, fx, fy 들어있음
+        # SDF 차원 확장
+        sdf = sdf[..., np.newaxis] # (..., 1) -> (B, H, W, 1) or (H, W, 1)
+        scalars_np = np.concatenate([hsi, sdf], axis=-1) # (..., 4)
         vectors_np = data_dict['gradient']
-        
-        # 3. Global Stats
         v_shape_np = data_dict['v_shape']
 
-        # 4. To Tensor & Permute & Batch
-        # (H, W, C) -> (C, H, W) -> (1, C, H, W)
-        s_tensor = torch.from_numpy(scalars_np).permute(2, 0, 1).unsqueeze(0).float().to(device)
-        v_tensor = torch.from_numpy(vectors_np).permute(2, 0, 1).unsqueeze(0).float().to(device)
-        g_tensor = torch.from_numpy(v_shape_np).unsqueeze(0).float().to(device) # (1, 6)
+        if has_batch:
+            # Case A: Training (Batch Input)
+            # Input: (B, H, W, C) -> Output: (B, C, H, W)
+            # permute(0, 3, 1, 2): Batch(0), Channel(3), Height(1), Width(2)
+            s_tensor = torch.from_numpy(scalars_np).permute(0, 3, 1, 2).float().to(device)
+            v_tensor = torch.from_numpy(vectors_np).permute(0, 3, 1, 2).float().to(device)
+            g_tensor = torch.from_numpy(v_shape_np).float().to(device) # (B, 6)
+            
+        else:
+            # Case B: Inference (Single Image Input)
+            # Input: (H, W, C) -> Output: (1, C, H, W)
+            # permute(2, 0, 1): Channel(2), Height(0), Width(1)
+            # unsqueeze(0): Add Batch dim
+            s_tensor = torch.from_numpy(scalars_np).permute(2, 0, 1).unsqueeze(0).float().to(device)
+            v_tensor = torch.from_numpy(vectors_np).permute(2, 0, 1).unsqueeze(0).float().to(device)
+            g_tensor = torch.from_numpy(v_shape_np).unsqueeze(0).float().to(device) # (1, 6)
 
         return s_tensor, v_tensor, g_tensor
 
