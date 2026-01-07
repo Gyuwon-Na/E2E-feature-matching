@@ -199,7 +199,7 @@ class MathGeometricPreprocessor:
         pyramid_data = []
         current_img = img_rgb.copy()
         
-        print(f"Processing Pyramid (Levels={levels})...")
+        # print(f"Processing Pyramid (Levels={levels})...")
         
         for i in range(levels):
             # 1. 현재 스케일 특징 추출

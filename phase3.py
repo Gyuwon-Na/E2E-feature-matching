@@ -216,7 +216,7 @@ class RotorScaleAttention(nn.Module):
         r_mag_k = r_mag.transpose(-2, -1)
         
         # 루프 진행 상황 시각화 (N이 클 때만 활성화하여 오버헤드 방지)
-        pbar = tqdm(range(0, N, CHUNK_SIZE), desc=f"  [Attn] Chunks (N={N})", leave=False, disable=(N <= SAFE_N_LIMIT))
+        pbar = tqdm(range(0, N, CHUNK_SIZE), desc=f"  [Attn] Chunks (N={N})", leave=False, disable=True)
 
         with torch.amp.autocast('cuda', enabled=True):
             for i in pbar:
@@ -529,7 +529,7 @@ class Phase3Transformer(nn.Module):
         dec_feat, last_rotor = None, None
         
         # [Visual Fix] tqdm으로 전체 레벨 진행상황 표시
-        level_iter = tqdm(reversed(range(len(pyramid_a))), total=len(pyramid_a), desc="Phase 3: Pyramid Levels")
+        level_iter = tqdm(reversed(range(len(pyramid_a))), total=len(pyramid_a), desc="Phase 3: Pyramid Levels", disable=True)
         
         for i in level_iter:
             # 현재 어떤 연산 방식이 사용되는지 tqdm 설명에 표시
