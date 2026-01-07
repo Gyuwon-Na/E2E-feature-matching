@@ -21,8 +21,8 @@ from phase2 import CliffordPyramidEmbedder
 from phase3 import Phase3Transformer
 
 # [Rule 2] Hyperparameters (6GB GPU 최적화 설정)
-BATCH_SIZE = 2          # [보완] 메모리 한계로 1로 하향
-NUM_EPOCHS = 100       # 충분한 학습 기회 제공
+BATCH_SIZE = 1          # [보완] 메모리 한계로 1로 하향
+NUM_EPOCHS = 1000       # 충분한 학습 기회 제공
 LEARNING_RATE = 1e-4    
 PATIENCE = 15           
 IMG_SIZE = (224, 224)   # [보완] 256에서 224로 축소하여 메모리 확보 (OOM 시 128로 더 줄이세요)
@@ -92,9 +92,8 @@ class GeometricDataset(Dataset):
         img_warped = cv2.warpAffine(img_rgb, M_warp, (cols, rows), borderMode=cv2.BORDER_REFLECT)
 
         # Calculate W_GT
-        # [수정] M_warp 행렬을 그대로 사용해야 함
-        M_warp_aug = np.vstack([M_warp, [0, 0, 1]])
-        W_gt_mat_pixel = M_warp_aug[:2, :] # 역행렬 연산 제거!
+        M_warp_aug = np.vstack([M_warp, [0, 0, 1]]) 
+        W_gt_mat_pixel = np.linalg.inv(M_warp_aug)[:2, :] 
 
         # [보완] 픽셀 단위 행렬을 정규화된 행렬로 변환
         W_gt_mat_norm = self.normalize_affine_matrix(W_gt_mat_pixel, cols, rows)
@@ -140,29 +139,93 @@ def collate_fn_geometric(batch):
     }
 
 class UnifiedGeometricLoss(nn.Module):
-    def __init__(self):
+    def __init__(self, alpha=1.0, beta=1.0, lambda_c=1.0, lambda_s=0.5):
         super().__init__()
-        self.l1_loss = nn.L1Loss()
-        
+        self.alpha = alpha 
+        self.beta = beta   
+        self.lambda_c = lambda_c
+        self.lambda_s = lambda_s
+        self.smooth_l1 = nn.SmoothL1Loss(beta=1.0) 
+
+    def get_affine_grid(self, matrix, size):
+        B, C, H, W = size
+        return F.affine_grid(matrix, [B, C, H, W], align_corners=False)
+
+    def extract_local_rotation(self, w_gt):
+        rotation_part = w_gt[:, :2, :2]
+        u, s, v = torch.linalg.svd(rotation_part)
+        rot_matrix = torch.matmul(u, v.transpose(-2, -1))
+        return rot_matrix
+
     def forward(self, phase2_out_a, phase2_out_b, pred_w_global, w_gt):
-        B = w_gt.shape[0]
+        s_a, v_a, b_a = phase2_out_a
+        s_b, v_b, b_b = phase2_out_b
         
-        # 1. Corner Point Error (가장 중요)
-        # 이미지 네 모서리 좌표 [-1, 1]
+        size = s_a.shape
+        B, C_s, H, W = size
+        
+        # Warp Features of B
+        grid_gt = self.get_affine_grid(w_gt, size)
+        
+        s_b_warped = F.grid_sample(s_b, grid_gt, align_corners=False)
+        
+        B, C_v, Comp, H, W = v_b.shape 
+        v_b_flat = v_b.view(B, C_v * Comp, H, W) 
+        v_b_warped_flat = F.grid_sample(v_b_flat, grid_gt, align_corners=False)
+        v_b_warped = v_b_warped_flat.view(B, C_v, Comp, H, W) 
+        
+        rotor_a = torch.cat([b_a[0], b_a[1]], dim=1) 
+        rotor_b = torch.cat([b_b[0], b_b[1]], dim=1)
+        rotor_b_warped = F.grid_sample(rotor_b, grid_gt, align_corners=False)
+
+        # Loss Calculations
+        l_s = F.mse_loss(s_a, s_b_warped)
+
+        rot_matrix = self.extract_local_rotation(w_gt) 
+        v_b_rotated = torch.einsum('bij, bcjhw -> bcihw', rot_matrix, v_b_warped)
+        l_v = F.mse_loss(v_a, v_b_rotated)
+
+        # [수정] 하드코딩 제거: 입력 채널에 맞춰 동적으로 Reshape
+        # rotor_b_warped shape: (B, C_total, H, W) -> C_total은 hidden_dim * 2
+        C_total = rotor_b_warped.shape[1] 
+        hidden_dim = C_total // 2
+        
+        # (B, 64, 2, ...) -> (B, hidden_dim, 2, ...) 로 변경
+        rotor_b_warped_reshaped = rotor_b_warped.view(B, hidden_dim, 2, H, W)
+        
+        rotor_b_rotated = torch.einsum('bij, bcjhw -> bcihw', rot_matrix, rotor_b_warped_reshaped)
+        
+        # 다시 원래 채널 수로 복구 (B, C_total, H, W)
+        rotor_b_rotated_flat = rotor_b_rotated.reshape(B, C_total, H, W)
+        
+        l_b = F.mse_loss(rotor_a, rotor_b_rotated_flat)
+
         corners = torch.tensor([
             [-1., -1., 1.], [1., -1., 1.],
             [1., 1., 1.], [-1., 1., 1.]
-        ], device=pred_w_global.device).unsqueeze(0).repeat(B, 1, 1)
+        ], device=s_a.device).unsqueeze(0).repeat(B, 1, 1) 
+        
+        corners_gt = torch.bmm(w_gt, corners.transpose(1, 2))      
+        corners_pred = torch.bmm(pred_w_global, corners.transpose(1, 2)) 
+        l_coord = self.smooth_l1(corners_pred, corners_gt)
 
-        # 정답 좌표 변환
-        gt_pts = torch.bmm(w_gt, corners.transpose(1, 2))
-        # 예측 좌표 변환
-        pred_pts = torch.bmm(pred_w_global, corners.transpose(1, 2))
+        grid_pred = self.get_affine_grid(pred_w_global, size)
+        s_b_recon = F.grid_sample(s_b, grid_pred, align_corners=False)
+        l_sdf_photo = F.mse_loss(s_a, s_b_recon)
+
+        loss_geometric = l_s + l_v + l_b
+        loss_consistency = self.lambda_c * l_coord + self.lambda_s * l_sdf_photo
         
-        # L1 Loss 사용 (MSE보다 Outlier에 강건함)
-        l_coord = self.l1_loss(pred_pts, gt_pts)
+        total_loss = self.alpha * loss_geometric + self.beta * loss_consistency
         
-        return l_coord, {"loss": l_coord.item(), "l_coord": l_coord.item()}
+        return total_loss, {
+            "loss": total_loss.item(),
+            "l_s": l_s.item(),
+            "l_v": l_v.item(),
+            "l_b": l_b.item(),
+            "l_coord": l_coord.item(),
+            "l_sdf": l_sdf_photo.item()
+        }
     
 def train():
     # 1. Setup
@@ -185,23 +248,6 @@ def train():
         num_layers=NUM_LAYERS, 
         embed_dim=32 
     ).to(DEVICE)
-
-    # [핵심 추가] 마지막 레이어의 가중치를 조절하여 Identity 변환에서 시작하도록 강제
-    # 모델 구조에 따라 다르지만, 보통 마지막 Linear 레이어를 찾아 초기화합니다.
-    # 여기서는 Transformer의 출력이 바로 rotor_map이라고 가정하고, 
-    # 모델 내부 혹은 학습 루프 진입 전 bias를 설정하는 것이 좋습니다.
-
-    # 간단한 방법: Transformer의 마지막 레이어 가중치를 0으로 만들고, 
-    # Bias를 [1, 0, 0, 0] (cos=1, sin=0, dx=0, dy=0)이 되도록 설정
-    for m in transformer.modules():
-        if isinstance(m, nn.Conv2d) or isinstance(m, nn.Linear):
-            # 마지막 레이어라고 추정되는 부분 (출력 채널이 output dim과 같은 경우)
-            if hasattr(m, 'out_channels') and m.out_channels == 4: # rotor dim
-                nn.init.constant_(m.weight, 0)
-                # cos, sin, dx, dy 순서라면
-                nn.init.constant_(m.bias, 0) 
-                m.bias.data[0] = 1.0 # cos = 1.0 (Scale=1, Rot=0)
-                print("Initialized last layer to Identity transform.")
 
     # 3. Optimizer & Scaler
     optimizer = optim.Adam(
