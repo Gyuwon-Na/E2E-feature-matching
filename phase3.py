@@ -474,7 +474,7 @@ class GeometricSkipConnection(nn.Module):
 # =============================================================================
 
 class Phase3Transformer(nn.Module):
-    def __init__(self, feature_dim=384, num_layers=2):
+    def __init__(self, feature_dim=384, num_layers=2, embed_dim=64):
         """
         [Phase 3 Main Module]
         Phase 2의 피라미드를 입력받아 인코딩 및 디코딩 수행.
@@ -485,12 +485,17 @@ class Phase3Transformer(nn.Module):
         self.feature_dim = feature_dim
         
         # Phase 2 Output Adapters
-        self.adapt_s = nn.Conv2d(64, feature_dim // 3, 1)
-        self.adapt_v_proj = nn.Conv2d(128, feature_dim // 3, 1)
-        self.adapt_b = nn.Conv2d(64, feature_dim // 3, 1)
+        # Phase 2 Output Adapters [수정] 하드코딩 제거 및 embed_dim 연동
+        # S: (B, 32, H, W) -> embed_dim
+        self.adapt_s = nn.Conv2d(embed_dim, feature_dim // 3, 1)
+        
+        # V: (B, 32, 2, H, W) -> Flatten -> (B, 64, H, W) -> embed_dim * 2
+        self.adapt_v_proj = nn.Conv2d(embed_dim * 2, feature_dim // 3, 1)
+        
+        # B: (B, 32, H, W) -> embed_dim
+        self.adapt_b = nn.Conv2d(embed_dim, feature_dim // 3, 1)
         
         self.tokenizer = GeometricTokenizer(in_channels=feature_dim, hidden_dim=feature_dim)
-        
         self.encoder_layers = nn.ModuleList([
             GeometricEncoderBlock(feature_dim) for _ in range(num_layers)
         ])

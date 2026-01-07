@@ -1,5 +1,10 @@
 import os
+# [핵심 수정 1] GUI 창을 띄우지 않고 파일로 저장하는 'Agg' 백엔드 사용
+import matplotlib
+matplotlib.use('Agg') 
+
 import cv2
+import time
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -10,194 +15,197 @@ from tqdm import tqdm
 from phase1 import MathGeometricPreprocessor
 from phase2 import CliffordPyramidEmbedder
 from phase3 import Phase3Transformer
+from phase4 import GeometricMPCRefiner 
 
-# [Hyperparameters]
-IMG_SIZE = (256, 256)
+# [설정] 평가 환경
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"Running Evaluation on: {DEVICE}")
+
+IMG_SIZE = (224, 224)
+FEATURE_DIM = 96
+NUM_LAYERS = 1
+EMBED_DIM = 32
 MODEL_PATH = "best_model.pth"
-MATCHING_THRESHOLD = 5.0  # 픽셀 단위 (이 거리 이내면 성공으로 간주)
+TEST_IMG_DIR = "./val2017"
+TEST_SAMPLES = 50
 
-def denormalize_affine_matrix(matrix_norm, width, height):
-    """
-    PyTorch Normalized 좌표계([-1, 1]) 행렬을 Pixel 좌표계 행렬로 변환
-    """
-    # Normalized -> Pixel 변환 행렬
-    # x_pix = (x_norm + 1) * (width/2)
-    
-    # N_inv: Normalized -> Pixel
-    N_inv = np.array([
-        [width / 2.0, 0, width / 2.0],
-        [0, height / 2.0, height / 2.0],
-        [0, 0, 1]
-    ])
-    
-    # N: Pixel -> Normalized
-    N = np.array([
-        [2.0 / width, 0, -1],
-        [0, 2.0 / height, -1],
-        [0, 0, 1]
-    ])
-    
-    # M_pix = N_inv @ M_norm @ N
-    # 하지만 입력 matrix_norm은 좌표를 변환하는 행렬이므로
-    # P_norm_new = M_norm @ P_norm_old
-    # -> N @ P_pix_new = M_norm @ (N @ P_pix_old)
-    # -> P_pix_new = (N_inv @ M_norm @ N) @ P_pix_old
-    
-    M_norm_aug = np.vstack([matrix_norm, [0, 0, 1]])
-    M_pix_aug = N_inv @ M_norm_aug @ N
-    
-    return M_pix_aug[:2, :]
+# [결과 저장 폴더 생성]
+SAVE_DIR = "./eval_results"
+os.makedirs(SAVE_DIR, exist_ok=True)
 
-def get_correspondences(w_matrix, width, height, num_points=10):
-    """
-    이미지에 격자 점을 생성하고 w_matrix로 변환된 좌표를 반환
-    """
-    # 1. 격자 점 생성 (Source Image A 기준)
-    x = np.linspace(width * 0.1, width * 0.9, num_points)
-    y = np.linspace(height * 0.1, height * 0.9, num_points)
-    xv, yv = np.meshgrid(x, y)
-    
-    src_pts = np.vstack([xv.flatten(), yv.flatten()]).T # (N, 2)
-    
-    # 2. 변환 적용 (Target Image B에서의 위치 계산)
-    # [x', y']^T = W * [x, y, 1]^T
-    ones = np.ones((src_pts.shape[0], 1))
-    src_pts_aug = np.hstack([src_pts, ones]) # (N, 3)
-    
-    dst_pts = (w_matrix @ src_pts_aug.T).T # (N, 2)
-    
-    return src_pts, dst_pts
+class GeometricEvaluator:
+    def __init__(self):
+        print(f"[Init] Loading Model from {MODEL_PATH}...")
+        
+        self.embedder = CliffordPyramidEmbedder(hidden_dim=EMBED_DIM).to(DEVICE)
+        self.transformer = Phase3Transformer(
+            feature_dim=FEATURE_DIM, 
+            num_layers=NUM_LAYERS, 
+            embed_dim=EMBED_DIM
+        ).to(DEVICE)
+        
+        if os.path.exists(MODEL_PATH):
+            checkpoint = torch.load(MODEL_PATH, map_location=DEVICE)
+            self.embedder.load_state_dict(checkpoint['embedder'])
+            self.transformer.load_state_dict(checkpoint['transformer'])
+            print("[Init] Model Weights Loaded Successfully.")
+        else:
+            raise FileNotFoundError(f"No checkpoint found at {MODEL_PATH}")
+            
+        self.embedder.eval()
+        self.transformer.eval()
+        self.preprocessor = MathGeometricPreprocessor()
+        self.refiner = GeometricMPCRefiner(device=DEVICE)
 
-def evaluate_and_visualize(img_path):
-    print(f"\n[Evaluation] Processing {img_path}...")
-    
-    # 1. Image Load & Preprocess
-    img_bgr = cv2.imread(img_path)
-    if img_bgr is None:
-        print("Image load failed.")
-        return
-    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-    img_rgb = cv2.resize(img_rgb, IMG_SIZE)
-    rows, cols = img_rgb.shape[:2]
+    def get_affine_grid(self, matrix, size):
+        B, C, H, W = size
+        return F.affine_grid(matrix, [B, C, H, W], align_corners=False)
 
-    # 2. Generate Warp (Simulation)
-    angle = np.random.uniform(-30, 30)
-    scale = np.random.uniform(0.8, 1.2)
-    M_warp = cv2.getRotationMatrix2D((cols/2, rows/2), angle, scale)
-    img_warped = cv2.warpAffine(img_rgb, M_warp, (cols, rows), borderMode=cv2.BORDER_REFLECT)
-    
-    # 3. Ground Truth W 계산 (Pixel 단위)
-    # A(Warped) -> B(Original)
-    M_warp_aug = np.vstack([M_warp, [0, 0, 1]])
-    W_gt_pixel = np.linalg.inv(M_warp_aug)[:2, :] # 정답 행렬
+    def compute_corner_error(self, pred_w, gt_w, h, w):
+        corners = torch.tensor([
+            [-1., -1., 1.], [1., -1., 1.],
+            [1., 1., 1.], [-1., 1., 1.]
+        ], device=DEVICE).unsqueeze(0)
+        
+        gt_pts = torch.bmm(gt_w, corners.transpose(1, 2))
+        pred_pts = torch.bmm(pred_w, corners.transpose(1, 2))
+        
+        dist_norm = torch.norm(gt_pts - pred_pts, dim=1)
+        avg_dist_norm = dist_norm.mean().item()
+        
+        avg_pixel_scale = (h + w) / 4.0
+        return avg_dist_norm * avg_pixel_scale
 
-    # 4. Model Inference
-    preprocessor = MathGeometricPreprocessor()
-    pyramid_a = preprocessor.process_pyramid(img_warped, levels=4)
-    pyramid_b = preprocessor.process_pyramid(img_rgb, levels=4)
-    
-    embedder = CliffordPyramidEmbedder(hidden_dim=64).to(DEVICE)
-    transformer = Phase3Transformer(feature_dim=192).to(DEVICE)
-    
-    # Load Checkpoint
-    if not os.path.exists(MODEL_PATH):
-        print("Checkpoint not found!")
-        return
+    def predict_transform(self, img_src, img_tgt):
+        with torch.no_grad():
+            pyr_src = self.preprocessor.process_pyramid(img_src, levels=4)
+            pyr_tgt = self.preprocessor.process_pyramid(img_tgt, levels=4)
+            
+            p2_src = self.embedder(pyr_src, DEVICE)
+            p2_tgt = self.embedder(pyr_tgt, DEVICE)
+            
+            results = self.transformer(p2_src, p2_tgt)
+            
+            dense_rotor = results[0]['rotor_map']
+            avg_rotor = dense_rotor.mean(dim=(1, 2))
+            cos, sin, dx, dy = avg_rotor[:, 0], avg_rotor[:, 1], avg_rotor[:, 2], avg_rotor[:, 3]
+            
+            row1 = torch.stack([cos, -sin, dx], dim=1)
+            row2 = torch.stack([sin, cos, dy], dim=1)
+            pred_w = torch.stack([row1, row2], dim=1)
+            
+            return pred_w, results[0]
 
-    checkpoint = torch.load(MODEL_PATH, map_location=DEVICE)
-    embedder.load_state_dict(checkpoint['embedder'])
-    transformer.load_state_dict(checkpoint['transformer'])
-    
-    embedder.eval()
-    transformer.eval()
-    
-    with torch.no_grad():
-        # Phase 2
-        p2_a = embedder(pyramid_a, DEVICE)
-        p2_b = embedder(pyramid_b, DEVICE)
+    def run_evaluation(self):
+        import glob
+        import random
         
-        # Phase 3
-        results = transformer(p2_a, p2_b)
-        
-        # Extract Global W from Level 0
-        finest_res = results[0]
-        dense_rotor = finest_res['rotor_map'] # (B, H, W, 4)
-        avg_rotor = dense_rotor.mean(dim=(1, 2)) # (B, 4)
-        
-        cos_t, sin_t, dx_t, dy_t = avg_rotor[0, 0], avg_rotor[0, 1], avg_rotor[0, 2], avg_rotor[0, 3]
-        
-        # Construct Normalized W (2x3)
-        row1 = torch.stack([cos_t, -sin_t, dx_t])
-        row2 = torch.stack([sin_t, cos_t, dy_t])
-        W_pred_norm = torch.stack([row1, row2]).cpu().numpy()
+        img_paths = glob.glob(os.path.join(TEST_IMG_DIR, "*.jpg"))
+        if not img_paths:
+            print("No images found.")
+            return
 
-    # 5. Convert Normalized W -> Pixel W
-    W_pred_pixel = denormalize_affine_matrix(W_pred_norm, cols, rows)
-    
-    # 6. Calculate Accuracy
-    # 격자 점(Points)을 생성해서 GT와 Pred로 각각 변환해본 뒤 거리 측정
-    src_pts, dst_pts_pred = get_correspondences(W_pred_pixel, cols, rows, num_points=8)
-    _, dst_pts_gt = get_correspondences(W_gt_pixel, cols, rows, num_points=8)
-    
-    distances = np.linalg.norm(dst_pts_pred - dst_pts_gt, axis=1)
-    
-    inliers = distances < MATCHING_THRESHOLD
-    success_rate = (np.sum(inliers) / len(distances)) * 100
-    mean_error = np.mean(distances)
-    
-    print(f"  - GT Angle: {angle:.2f}, Scale: {scale:.2f}")
-    print(f"  - Success Rate: {success_rate:.1f}%")
-    print(f"  - Mean Pixel Error: {mean_error:.2f} px")
+        random.seed(999)
+        test_samples = random.sample(img_paths, min(len(img_paths), TEST_SAMPLES))
+        
+        errors = []
+        success_count_5px = 0
+        success_count_10px = 0
+        times = []
 
-    # 7. Visualization
-    vis_img = np.hstack([img_warped, img_rgb]) # 좌: Warped, 우: Original
-    
-    plt.figure(figsize=(12, 6))
-    plt.imshow(vis_img)
-    plt.title(f"Geometric Matching Evaluation\nSuccess Rate: {success_rate:.1f}% | Mean Err: {mean_error:.2f}px", 
-              fontsize=14, fontweight='bold')
-    
-    # 선 그리기
-    for i in range(len(src_pts)):
-        # Source 점 (왼쪽 이미지)
-        pt_a = src_pts[i]
+        print(f"\n[Eval] Starting Evaluation on {len(test_samples)} images...")
         
-        # Pred 점 (오른쪽 이미지) -> 좌표 보정 필요 (w 만큼 오른쪽으로 이동)
-        pt_b = dst_pts_pred[i]
-        pt_b_vis = pt_b + np.array([cols, 0]) 
-        
-        # GT 점 (오른쪽 이미지) - 비교용으로 작게 표시할 수도 있음 (여기선 생략하고 선 색으로 판별)
-        
-        color = 'lime' if inliers[i] else 'red'
-        alpha = 0.8 if inliers[i] else 0.4
-        
-        plt.plot([pt_a[0], pt_b_vis[0]], [pt_a[1], pt_b_vis[1]], 
-                 color=color, linewidth=1.5, alpha=alpha, marker='o', markersize=4)
-        
-        # GT 위치를 파란색 X로 살짝 표시 (어디가 정답이었는지)
-        if not inliers[i]:
-            pt_gt_vis = dst_pts_gt[i] + np.array([cols, 0])
-            plt.plot(pt_gt_vis[0], pt_gt_vis[1], 'bx', markersize=6, markeredgewidth=2)
-            # 예측 위치에서 정답 위치로 점선 연결 (오차 시각화)
-            plt.plot([pt_b_vis[0], pt_gt_vis[0]], [pt_b_vis[1], pt_gt_vis[1]], 
-                     color='yellow', linestyle=':', linewidth=1)
+        for i, path in enumerate(tqdm(test_samples)):
+            img_raw = cv2.imread(path)
+            img_rgb = cv2.cvtColor(img_raw, cv2.COLOR_BGR2RGB)
+            img_rgb = cv2.resize(img_rgb, IMG_SIZE)
+            h, w = img_rgb.shape[:2]
 
-    plt.axis('off')
-    plt.tight_layout()
-    plt.show()
+            angle = np.random.uniform(-30, 30)
+            scale = np.random.uniform(0.8, 1.2)
+            M_cv = cv2.getRotationMatrix2D((w/2, h/2), angle, scale)
+            img_warped = cv2.warpAffine(img_rgb, M_cv, (w, h), borderMode=cv2.BORDER_REFLECT)
+            
+            M_aug = np.vstack([M_cv, [0,0,1]])
+            M_inv = np.linalg.inv(M_aug)[:2, :]
+            
+            N = np.array([[2/w, 0, -1], [0, 2/h, -1], [0, 0, 1]])
+            N_inv = np.linalg.inv(N)
+            gt_w_np = N @ np.vstack([M_inv, [0,0,1]]) @ N_inv
+            gt_w = torch.tensor(gt_w_np[:2]).unsqueeze(0).float().to(DEVICE)
+
+            start_t = time.time()
+            pred_w, _ = self.predict_transform(img_warped, img_rgb)
+            
+            if DEVICE == "cuda":
+                torch.cuda.synchronize()
+                
+            times.append(time.time() - start_t)
+
+            err = self.compute_corner_error(pred_w, gt_w, h, w)
+            errors.append(err)
+            
+            if err < 5.0: success_count_5px += 1
+            if err < 10.0: success_count_10px += 1
+            
+            # [Visualization] 첫 5개 샘플만 저장
+            if i < 5: 
+                self.visualize(img_warped, img_rgb, pred_w, gt_w, i, err)
+
+        avg_err = np.mean(errors)
+        fps = 1.0 / np.mean(times)
+        
+        print("\n" + "="*40)
+        print(f"  [Evaluation Report] (N={len(test_samples)})")
+        print("="*40)
+        print(f"  * MACE (Avg Error) : {avg_err:.4f} pixels")
+        print(f"  * Success Rate (5px): {success_count_5px / len(test_samples) * 100:.2f}%")
+        print(f"  * Success Rate (10px): {success_count_10px / len(test_samples) * 100:.2f}%")
+        print(f"  * Inference Speed  : {fps:.2f} FPS")
+        print("="*40)
+        print(f"  * Visualization saved to: {SAVE_DIR}")
+
+    def visualize(self, src, tgt, pred_w, gt_w, idx, err):
+        src_tensor = torch.tensor(src).permute(2,0,1).unsqueeze(0).float().to(DEVICE) / 255.0
+        
+        grid_pred = self.get_affine_grid(pred_w, src_tensor.shape)
+        recon_pred = F.grid_sample(src_tensor, grid_pred, align_corners=False)
+        img_recon = recon_pred[0].permute(1,2,0).cpu().numpy()
+        
+        grid_gt = self.get_affine_grid(gt_w, src_tensor.shape)
+        recon_gt = F.grid_sample(src_tensor, grid_gt, align_corners=False)
+        img_gt_recon = recon_gt[0].permute(1,2,0).cpu().numpy()
+
+        plt.figure(figsize=(15, 5))
+        plt.suptitle(f"Evaluation Sample #{idx} (Error: {err:.2f} px)", fontsize=16)
+        
+        plt.subplot(1, 4, 1)
+        plt.title("Input (Warped Source)")
+        plt.imshow(src)
+        plt.axis('off')
+        
+        plt.subplot(1, 4, 2)
+        plt.title("Reference (Target)")
+        plt.imshow(tgt)
+        plt.axis('off')
+        
+        plt.subplot(1, 4, 3)
+        plt.title(f"Model Prediction\n(Restored)")
+        plt.imshow(np.clip(img_recon, 0, 1))
+        plt.axis('off')
+        
+        plt.subplot(1, 4, 4)
+        plt.title("Ground Truth\n(Perfect Align)")
+        plt.imshow(np.clip(img_gt_recon, 0, 1))
+        plt.axis('off')
+        
+        plt.tight_layout()
+        
+        # [핵심 수정 2] show() 대신 savefig() 사용
+        save_path = os.path.join(SAVE_DIR, f"result_{idx}.png")
+        plt.savefig(save_path)
+        plt.close() # 메모리 해제
 
 if __name__ == "__main__":
-    # 테스트할 이미지 경로 하나를 지정하세요
-    # 예: "./img/val/000000000139.jpg"
-    # 폴더 내의 첫 번째 이미지를 자동으로 찾습니다.
-    import glob
-    img_list = glob.glob("./img/val2017/*.jpg")
-    
-    if len(img_list) > 0:
-        # 랜덤으로 3장 뽑아서 테스트
-        for _ in range(3):
-            target_img = np.random.choice(img_list)
-            evaluate_and_visualize(target_img)
-    else:
-        print("No images found in ./img/val")
+    evaluator = GeometricEvaluator()
+    evaluator.run_evaluation()
