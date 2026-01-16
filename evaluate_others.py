@@ -17,8 +17,8 @@ IMG_SIZE = (256, 256)
 HIDDEN_DIM = 48
 FEATURE_DIM = 144
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-MODEL_PATH = "./checkpoints/best_model.pth"
-ANGLE_THRESHOLD = 5
+MODEL_PATH = "./checkpoints/final_model_early_stop.pth"
+ANGLE_THRESHOLD = 45
 
 # =========================================================
 # 1. My Model Pipeline (Phase 3 + MPC)
