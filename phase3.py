@@ -216,7 +216,7 @@ class RotorScaleAttention(nn.Module):
         r_mag_k = r_mag.transpose(-2, -1)
         
         # 루프 진행 상황 시각화 (N이 클 때만 활성화하여 오버헤드 방지)
-        pbar = tqdm(range(0, N, CHUNK_SIZE), desc=f"  [Attn] Chunks (N={N})", leave=False, disable=True)
+        pbar = tqdm(range(0, N, CHUNK_SIZE), desc=f"  [Attn] Chunks (N={N})", leave=False, disable=(N <= SAFE_N_LIMIT))
 
         with torch.amp.autocast('cuda', enabled=True):
             for i in pbar:
@@ -474,28 +474,23 @@ class GeometricSkipConnection(nn.Module):
 # =============================================================================
 
 class Phase3Transformer(nn.Module):
-    def __init__(self, feature_dim=384, num_layers=2, embed_dim=64):
+    # embed_dim 파라미터 추가 (기본값 64 -> 48로 변경된 것에 대응하기 위함)
+    def __init__(self, feature_dim=192, num_layers=2, embed_dim=48): 
         """
-        [Phase 3 Main Module]
-        Phase 2의 피라미드를 입력받아 인코딩 및 디코딩 수행.
-        하이퍼파라미터
-            - feature_dim: 384 등으로 늘리면 표현력이 좋아짐 (단, 3의 배수 유지 필수)
+        feature_dim: 트랜스포머 내부 연산 차원 (train.py의 FEATURE_DIM = 144)
+        embed_dim: Phase 2에서 넘어오는 차원 (train.py의 HIDDEN_DIM = 48)
         """
         super().__init__()
         self.feature_dim = feature_dim
         
-        # Phase 2 Output Adapters
-        # Phase 2 Output Adapters [수정] 하드코딩 제거 및 embed_dim 연동
-        # S: (B, 32, H, W) -> embed_dim
-        self.adapt_s = nn.Conv2d(embed_dim, feature_dim // 3, 1)
-        
-        # V: (B, 32, 2, H, W) -> Flatten -> (B, 64, H, W) -> embed_dim * 2
-        self.adapt_v_proj = nn.Conv2d(embed_dim * 2, feature_dim // 3, 1)
-        
-        # B: (B, 32, H, W) -> embed_dim
-        self.adapt_b = nn.Conv2d(embed_dim, feature_dim // 3, 1)
+        # [수정된 부분] 64, 128 같은 고정값 대신 embed_dim 변수 사용
+        # S(1개), V(2개=2배), B(1개) 구조임
+        self.adapt_s = nn.Conv2d(embed_dim, feature_dim // 3, 1)       # 64 -> embed_dim
+        self.adapt_v_proj = nn.Conv2d(embed_dim * 2, feature_dim // 3, 1) # 128 -> embed_dim * 2
+        self.adapt_b = nn.Conv2d(embed_dim, feature_dim // 3, 1)       # 64 -> embed_dim
         
         self.tokenizer = GeometricTokenizer(in_channels=feature_dim, hidden_dim=feature_dim)
+        
         self.encoder_layers = nn.ModuleList([
             GeometricEncoderBlock(feature_dim) for _ in range(num_layers)
         ])
@@ -534,12 +529,9 @@ class Phase3Transformer(nn.Module):
         dec_feat, last_rotor = None, None
         
         # [Visual Fix] tqdm으로 전체 레벨 진행상황 표시
-        level_iter = tqdm(reversed(range(len(pyramid_a))), total=len(pyramid_a), desc="Phase 3: Pyramid Levels", disable=True)
+        level_iter = reversed(range(len(pyramid_a)))
         
         for i in level_iter:
-            # 현재 어떤 연산 방식이 사용되는지 tqdm 설명에 표시
-            mode_str = "(Transformer)" if i >= 2 else "(CNN Refine)"
-            level_iter.set_description(f"Phase 3: Level {i} {mode_str}")
             raw_a = self.prepare_input(pyramid_a[i])
             
             # --- [Stage 2.3 속도 최적화: 연산 분기] ---
