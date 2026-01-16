@@ -18,7 +18,8 @@ from phase3 import Phase3Transformer
 # [Hyperparameters for 6GB VRAM]
 BATCH_SIZE = 1          # [OOM 방지 2] 배치를 1로 줄임 (무조건!)
 ACCUM_STEPS = 8         # [OOM 방지 2] 대신 8번 모아서 업데이트 (실제 배치 8 효과)
-NUM_EPOCHS = 200        
+NUM_EPOCHS = 200     
+CURRICULUM_END_EPOCH = 100   
 LEARNING_RATE = 2e-4    
 IMG_SIZE = (256, 256)   # 해상도 유지 (256이 한계일 수 있음)
 PATIENCE = 15           
@@ -246,25 +247,40 @@ def train():
         print(f"Epoch {epoch+1} Finished | Average Loss: {avg_loss:.6f}") # <--- 이 줄 추가!
 
         # 모델 저장 (6GB 환경에선 저장도 가끔 실패할 수 있으니 try-except 추천하나 일단 진행)
-        if avg_loss < best_loss:
-            best_loss = avg_loss
-            patience_counter = 0 
-            torch.save({
-                'embedder': embedder.state_dict(), 
-                'transformer': transformer.state_dict(),
-                'hidden_dim': HIDDEN_DIM,   # 나중에 로드할 때 알기 위해 저장
-                'feature_dim': FEATURE_DIM
-            }, os.path.join(save_dir, "best_model.pth"))
-            print(f"  [Save] New Best Loss: {best_loss:.6f}")
-        else:
-            patience_counter += 1
-            print(f"  [Info] Patience: {patience_counter}/{PATIENCE} (Best: {best_loss:.6f})")
+        if epoch < CURRICULUM_END_EPOCH:
+            print(f"  [Warm-up] Curriculum getting harder... (Best Loss reset pending)")
+            # 워밍업 중에도 모델 저장은 하고 싶다면 아래 주석 해제
+            # if avg_loss < best_loss:
+            #     best_loss = avg_loss
+            #     torch.save(..., "best_model.pth")
             
-            if patience_counter >= PATIENCE:
-                print("  [Stop] Early Stopping Triggered!")
-                torch.save({'embedder': embedder.state_dict(), 'transformer': transformer.state_dict()}, 
-                           os.path.join(save_dir, "final_model_early_stop.pth"))
-                break
+            # 워밍업 마지막 에폭일 때, Best Loss를 무한대로 초기화! (과거 세탁)
+            if epoch == CURRICULUM_END_EPOCH - 1:
+                best_loss = float('inf')
+                print("  [Reset] Warm-up Done! Resetting Best Loss for Fair Competition.")
+
+        else:
+            # [핵심 수정 2] 이제부터 진짜 승부 (Epoch 31~)
+            if avg_loss < best_loss:
+                best_loss = avg_loss
+                patience_counter = 0 
+                # Best Model 저장
+                torch.save({
+                    'embedder': embedder.state_dict(), 
+                    'transformer': transformer.state_dict(),
+                    'hidden_dim': HIDDEN_DIM,
+                    'feature_dim': FEATURE_DIM
+                }, os.path.join(save_dir, "best_model.pth"))
+                print(f"  [Save] New Best Loss (Hard Mode): {best_loss:.6f}")
+            else:
+                patience_counter += 1
+                print(f"  [Info] Patience: {patience_counter}/{PATIENCE} (Best: {best_loss:.6f})")
+                
+                if patience_counter >= PATIENCE:
+                    print("  [Stop] Early Stopping Triggered!")
+                    torch.save({'embedder': embedder.state_dict(), 'transformer': transformer.state_dict()}, 
+                               os.path.join(save_dir, "final_model_early_stop.pth"))
+                    break
             
 if __name__ == "__main__":
     # GPU 캐시 비우고 시작
