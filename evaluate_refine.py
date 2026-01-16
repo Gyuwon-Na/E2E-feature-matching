@@ -22,6 +22,7 @@ FEATURE_DIM = 144        # Train과 동일
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 MODEL_PATH = "./checkpoints/best_model.pth"
 MATCHING_THRESHOLD = 5.0 
+ANGLE_THRESHOLD = 45.0
 
 def normalize_rotor_output(cos_raw, sin_raw):
     magnitude = torch.sqrt(cos_raw**2 + sin_raw**2 + 1e-6)
@@ -70,7 +71,7 @@ def evaluate_with_mpc(img_path, model_components):
     rows, cols = img_rgb.shape[:2]
 
     # 2. Random Warp (문제 출제)
-    angle = np.random.uniform(-5, 5) # 회전만 적용
+    angle = np.random.uniform(-ANGLE_THRESHOLD, ANGLE_THRESHOLD) # 회전만 적용
     scale = 1.0 
     
     M_warp = cv2.getRotationMatrix2D((cols/2, rows/2), angle, scale)
