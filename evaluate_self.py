@@ -20,7 +20,7 @@ IMG_SIZE = (256, 256)
 HIDDEN_DIM = 48          # Train과 동일
 FEATURE_DIM = 144        # Train과 동일
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-MODEL_PATH = "./checkpoints/final_model_early_stop.pth"
+MODEL_PATH = "./checkpoints/last_model.pth"
 MATCHING_THRESHOLD = 5.0 
 ANGLE_THRESHOLD = 45.0
 
