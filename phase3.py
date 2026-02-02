@@ -1,5 +1,24 @@
+"""
+================================================================================
+Phase 3: Geometric Transformer & Decoder
+================================================================================
+[Architecture.md §3 참조]
+
+Phase 2에서 준비된 해상도별 S, V, B 꾸러미를 입력받아, 이미지 간의 기하학적 
+대응 관계를 추론하고 초정밀 매칭 지도를 생성하는 최종 공정입니다.
+
+주요 단계:
+- Stage 1: Tokenization & Alignment
+- Stage 2: Encoder (CPE, Rotor-Scale Attention, Geometric Descriptor Guidance)
+- Stage 3: Decoder (Cross-Attention, Clifford Interpolation, Skip-Connection)
+
+출력:
+- Dense Rotor Map: (cos, sin, dx, dy) 픽셀별 변환
+- MPC Map: Phase 4로 전달되는 에너지 포텐셜 + 벡터 필드
+================================================================================
+"""
+
 import os
-# [System] OOM 방지를 위한 메모리 단편화 설정
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import torch
@@ -13,22 +32,42 @@ from torch.utils.checkpoint import checkpoint
 from tqdm import tqdm
 
 from phase1 import MathGeometricPreprocessor
-from phase2 import CliffordPyramidEmbedder
+from phase2 import CliffordPyramidEmbedder, HIDDEN_DIM
+
+# =============================================================================
+# [Hyperparameters] Phase 3
+# =============================================================================
+FEATURE_DIM = 144                # [Hyperparameter] Transformer 내부 연산 차원
+NUM_ENCODER_LAYERS = 2           # [Hyperparameter] Encoder 블록 수
+NUM_ATTENTION_HEADS = 4          # [Hyperparameter] Multi-Head Attention 헤드 수
+SE_REDUCTION = 16                # [Hyperparameter] SE Block 축소 비율
+SAFE_N_LIMIT = 4096              # [Hyperparameter] Chunking 없이 처리할 최대 픽셀 수
+SAFE_ELEMENTS = 2**20            # [Hyperparameter] Chunk당 최대 요소 수 (~100만)
+HIGH_RES_SKIP_LEVEL = 2          # [Hyperparameter] Attention 생략할 고해상도 레벨 임계값
+
+
+# =============================================================================
+# [공통 빌딩 블록]
+# =============================================================================
 
 class Mish(nn.Module):
     """
-    [Activation] Softplus보다 Gradient 흐름이 좋고 기하학적 정보 보존에 유리한 Mish
+    [Activation] Mish
+    
+    Softplus보다 Gradient 흐름이 좋고 기하학적 정보 보존에 유리
     f(x) = x * tanh(softplus(x))
     """
     def forward(self, x):
         return x * torch.tanh(F.softplus(x))
 
+
 class SEBlock(nn.Module):
     """
     [Lightweight Attention] Channel Attention (Squeeze-and-Excitation)
+    
     중요한 물리적 채널(S, V, B 중 특정 성분)을 강조
     """
-    def __init__(self, channel, reduction=16):
+    def __init__(self, channel, reduction=SE_REDUCTION):
         super().__init__()
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
         self.fc = nn.Sequential(
@@ -44,17 +83,19 @@ class SEBlock(nn.Module):
         y = self.fc(y).view(b, c, 1, 1)
         return x * y.expand_as(x)
 
+
 class GeometricResBlock(nn.Module):
     """
     [Refinement] Residual + Dilated Conv + SE Block
+    
     넓은 수용장(Context)과 채널 중요도(Attention)를 동시에 잡음
     """
     def __init__(self, dim, dilation=1):
         super().__init__()
-        self.conv1 = nn.Conv2d(dim, dim, 3, padding=dilation, dilation=dilation, groups=dim//3) # Group Conv 유지
-        self.norm1 = nn.GroupNorm(dim//16, dim) # GroupNorm이 회전에 강함
+        self.conv1 = nn.Conv2d(dim, dim, 3, padding=dilation, dilation=dilation, groups=dim//3)
+        self.norm1 = nn.GroupNorm(dim//16, dim)
         self.act = Mish()
-        self.conv2 = nn.Conv2d(dim, dim, 3, padding=1) # 일반 Conv로 정보 융합
+        self.conv2 = nn.Conv2d(dim, dim, 3, padding=1)
         self.norm2 = nn.GroupNorm(dim//16, dim)
         self.se = SEBlock(dim)
 
@@ -65,22 +106,26 @@ class GeometricResBlock(nn.Module):
         out = self.act(out)
         out = self.conv2(out)
         out = self.norm2(out)
-        out = self.se(out) # Attention
+        out = self.se(out)
         return out + residual
-    
+
+
 # =============================================================================
 # [Stage 1] Tokenization & Alignment
 # =============================================================================
 
 class GeometricTokenizer(nn.Module):
+    """
+    [Stage 1. Tokenization]
+    
+    Architecture.md §3.1 - 토큰화
+    
+    입력된 물리량(S, V, B)을 그룹별로 나누어 Group=3인 Conv 적용.
+    S, V, B 그룹 간의 독립성을 유지하며 초기 특징을 추출합니다.
+    """
     def __init__(self, in_channels, hidden_dim):
-        """
-        [Stage 1. Tokenization]
-        입력된 물리량(S, V, B)을 그룹별로 나누어 Group=3인 Conv 적용.
-        S, V, B 그룹 간의 독립성을 유지하며 초기 특징을 추출합니다.
-        """
         super().__init__()
-        # [Hyperparameter] groups=3: S, V, B 각각 독립적 연산
+        # groups=3: S, V, B 각각 독립적 연산
         self.group_conv = nn.Conv2d(
             in_channels, 
             hidden_dim, 
@@ -93,30 +138,44 @@ class GeometricTokenizer(nn.Module):
     def forward(self, x):
         return self.norm(self.group_conv(x))
 
+
 # =============================================================================
 # [Stage 2] Encoder Components
 # =============================================================================
 
 class GeometricCPE(nn.Module):
+    """
+    [Stage 2.2 위치 정보 주입] Conditional Position Encoding
+    
+    Architecture.md §3.2.2 - 위치 정보 주입
+    
+    Group Convolution 기반 CPE를 사용하여 픽셀 단위가 아닌 
+    '기하학적 덩어리' 단위로 위치를 파악합니다.
+    """
     def __init__(self, dim):
-        """
-        [Stage 2.2 위치 정보 주입]
-        Group Convolution 기반 CPE를 사용하여 픽셀 단위가 아닌 
-        '기하학적 덩어리' 단위로 위치를 파악합니다.
-        """
         super().__init__()
         self.pos_conv = nn.Conv2d(dim, dim, kernel_size=3, padding=1, groups=dim)
 
     def forward(self, x):
         return x + self.pos_conv(x)
 
+
 class IndependentLinear(nn.Module):
+    """
+    [Stage 2.1 Q, K, V 변환 - Independent Linear]
+    
+    Architecture.md §3.2.1 - Q, K, V 변환
+    
+    각 성분(S, V, B)이 가진 고유한 기하학적 정체성을 유지하기 위해
+    채널을 3분할하여 각각 독립된 Linear Layer를 통과시킵니다.
+    
+    | 입력 성분 | 생성되는 Q/K/V | 주요 역할 |
+    |---------|--------------|----------|
+    | Scalar  | Q_S, K_S, V_S | 존재 유무 및 에너지 유사도 판단 |
+    | Vector  | Q_V, K_V, V_V | 방향 정렬 및 스케일 차이 계산 |
+    | Bivector| Q_B, K_B, V_B | 회전 일관성 및 아핀 변환 대응 |
+    """
     def __init__(self, dim):
-        """
-        [Stage 2.1 Q, K, V 변환 - Independent Linear]
-        각 성분(S, V, B)이 가진 고유한 기하학적 정체성을 유지하기 위해
-        채널을 3분할하여 각각 독립된 Linear Layer를 통과시킵니다.
-        """
         super().__init__()
         self.dim = dim
         self.chunk_dim = dim // 3
@@ -128,7 +187,6 @@ class IndependentLinear(nn.Module):
 
     def forward(self, x):
         # x: (B, H, W, C)
-        # 채널을 3등분 (S, V, B)
         chunks = torch.chunk(x, 3, dim=-1)
         s, v, b = chunks[0], chunks[1], chunks[2]
         
@@ -138,27 +196,32 @@ class IndependentLinear(nn.Module):
         
         return torch.cat([s_out, v_out, b_out], dim=-1)
 
+
 class RotorScaleAttention(nn.Module):
-    def __init__(self, dim, num_heads=4):
-        """
-        [Stage 2.3 Rotor-Scale Attention & 2.4 Injection Fusion]
-        어텐션을 회전(Path A)과 스케일(Path B) 스트림으로 이원화하여 처리합니다.
-        Hidden State뿐만 아니라 Phase 2의 Rotor 정보(Side Input)를 직접 활용합니다.
-        하이퍼파라미터
-            - num_heads: 헤드 수가 많을수록 다양한 관점(스케일, 회전, 텍스처 등)을 동시에 봄.
-        """
+    """
+    [Stage 2.3 Rotor-Scale Attention & 2.4 Injection Fusion]
+    
+    Architecture.md §3.2.3 & §3.2.4 - Rotor-Scale Attention
+    
+    어텐션을 회전(Path A)과 스케일(Path B) 스트림으로 이원화하여 처리합니다.
+    Hidden State뿐만 아니라 Phase 2의 Rotor 정보(Side Input)를 직접 활용합니다.
+    
+    Path A: Unit Rotor (순수 회전 방향) - Rotation Invariant Matching
+    Path B: Magnitude (크기 정보) - Scale 비율을 Attention Bias로 사용
+    """
+    def __init__(self, dim, num_heads=NUM_ATTENTION_HEADS):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
                 
-        # [Stage 2.1] Q, K, V 변환 (Independent Linear 사용)
+        # [Stage 2.1] Q, K, V 변환 (Independent Linear)
         self.to_q = IndependentLinear(dim)
         self.to_k = IndependentLinear(dim)
         self.to_v = IndependentLinear(dim)
         
         self.proj = nn.Linear(dim, dim)
 
-        # 입력(x)을 보고 스케일 정보를 얼마나 반영할지(0~1) 결정
+        # [Stage 2.4] 스케일 정보 반영 정도 결정 (0~1)
         self.gate_net = nn.Sequential(
             nn.Linear(dim, dim // 4),
             nn.Mish(),
@@ -175,48 +238,37 @@ class RotorScaleAttention(nn.Module):
         B, H, W, C = x.shape
         N = H * W
         
-        # 1. Hidden State로부터 Q, K, V 생성
+        # 1. Q, K, V 생성
         q = self.to_q(x).view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.to_k(x).view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
         v = self.to_v(x).view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
         
-        # --- [OOM 방지 및 기하학적 정규화] ---
-        # 1. Path A (회전) 점수를 위해 Q, K 정규화
+        # [기하학적 정규화] Q, K 정규화
         q = F.normalize(q, dim=-1)
         k = F.normalize(k, dim=-1)
 
-        # --- [Phase 2 정보 추출 (Side Input)] ---
+        # [Phase 2 정보 추출]
         unit_cos, unit_sin, rotor_mag = rotor_tuple
         r_mag_mean = rotor_mag.mean(dim=1, keepdim=True) 
         r_mag = r_mag_mean.view(B, 1, N, 1)
 
-        # Gated Weight 계산 (B, N, 1) -> (B, 1, N, 1)
-        # 각 픽셀마다 "나는 스케일 정보가 필요해/필요없어"를 판단
+        # Gate Weight 계산
         gate_weight = self.gate_net(x).view(B, 1, N, 1)
 
         # -------------------------------------------------------------------------
-        # [Adaptive Chunking for Robust Memory Management]
-        # 해상도 N이 클수록 Chunk Size를 줄여서, 한 번에 계산하는 행렬 크기를 제한합니다.
-        # 목표: Chunk * N 행렬이 약 50MB~100MB를 넘지 않도록 조절
+        # [Adaptive Chunking for Memory Management]
         # -------------------------------------------------------------------------
-        
-        SAFE_N_LIMIT = 4096 
-        
         if N <= SAFE_N_LIMIT:
-            # [Fast Path] No Chunking
             CHUNK_SIZE = N
         else:
-            # [Safe Path] Adaptive Chunking
-            # Attention Matrix size (Chunk * N) 제한
-            SAFE_ELEMENTS = 2**20 # 약 100만개 (4MB) 정도로 여유 있게 설정
             CHUNK_SIZE = max(1, SAFE_ELEMENTS // N)
         
         output_chunks = []
         r_mag_v = r_mag.expand(B, self.num_heads, N, 1)
         r_mag_k = r_mag.transpose(-2, -1)
         
-        # 루프 진행 상황 시각화 (N이 클 때만 활성화하여 오버헤드 방지)
-        pbar = tqdm(range(0, N, CHUNK_SIZE), desc=f"  [Attn] Chunks (N={N})", leave=False, disable=(N <= SAFE_N_LIMIT))
+        pbar = tqdm(range(0, N, CHUNK_SIZE), desc=f"  [Attn] Chunks (N={N})", 
+                    leave=False, disable=(N <= SAFE_N_LIMIT))
 
         with torch.amp.autocast('cuda', enabled=True):
             for i in pbar:
@@ -224,63 +276,68 @@ class RotorScaleAttention(nn.Module):
                 r_mag_q_chunk = r_mag[:, :, i:i+CHUNK_SIZE, :]
                 gate_c = gate_weight[:, :, i:i+CHUNK_SIZE, :]
 
+                # [Path B] Scale 차이를 Attention Mask로 사용
                 scale_diff_chunk = torch.abs(
                     torch.log(r_mag_q_chunk + 1e-6) - 
                     torch.log(r_mag_k + 1e-6)
                 )
                 attn_mask_chunk = -scale_diff_chunk.to(q.dtype)
 
-                # 1. 메인 어텐션
+                # [Path A] 메인 어텐션
                 out_chunk = F.scaled_dot_product_attention(
                     q_chunk, k, v, 
                     attn_mask=attn_mask_chunk, 
                     dropout_p=0.0
                 )
 
-                # 2. Injection용 어텐션
+                # [Stage 2.4 Injection Fusion]
                 r_mag_attended_chunk = F.scaled_dot_product_attention(
                     q_chunk, k, r_mag_v,
                     attn_mask=attn_mask_chunk,
                     dropout_p=0.0
                 )
 
-                
                 injection_factor_chunk = r_mag_attended_chunk / (r_mag_q_chunk + 1e-6)
-                # 고정값 0.1 대신 학습된 Gate 사용 (Dynamic Injection)
-                # gate_c가 0이면 스케일 무시, 1이면 적극 반영
-
                 out_chunk = out_chunk * (1.0 + gate_c * injection_factor_chunk)
                 output_chunks.append(out_chunk)
                 
-                # [메모리 즉시 해제] Loop 안에서 생성된 중간 텐서 연결 끊기
                 del scale_diff_chunk, attn_mask_chunk, r_mag_attended_chunk
             
         out = torch.cat(output_chunks, dim=2)
         out = out.transpose(1, 2).reshape(B, H, W, C)
         return self.proj(out)
 
+
 class GeometricDescriptorGuidance(nn.Module):
+    """
+    [Stage 2.5 Geometric Descriptor Guidance]
+    
+    Architecture.md §3.2.5 - Geometric Descriptor Guidance
+    
+    각 성분에서 불변량을 뽑아 Gate를 생성하고, 
+    S, V, B의 중요도를 동적으로 조절합니다.
+    
+    1. Fast Lane: S, V, B 각각 독립적인 Layer 통과
+    2. Descriptor 생성: 회전/방향에 상관없는 불변량 추출
+    3. Gate Modulation: MLP로 Gate 값 (g_s, g_v, g_b) 생성
+    """
     def __init__(self, dim):
-        """
-        [Stage 2.5 Geometric Descriptor Guidance]
-        각 성분에서 불변량을 뽑아 Gate를 생성하고, S, V, B의 중요도를 동적으로 조절합니다.
-        """
         super().__init__()
         self.chunk_dim = dim // 3
         
-        # [Stage 2.5.1 Fast Lane & 2.5.2 Descriptor 생성]
+        # [Stage 2.5.1 & 2.5.2] Descriptor 생성 네트워크
         self.descriptor_net = nn.Sequential(
             nn.Linear(3, 16),
             nn.Mish(),
-            nn.Linear(16, 3), # Output: Gate values for S, V, B
-            nn.Sigmoid()      # [Stage 2.5.3 Gate Modulation] 0~1 사이 값
+            nn.Linear(16, 3),
+            nn.Sigmoid()  # [Stage 2.5.3] 0~1 사이 Gate 값
         )
 
     def forward(self, x):
         # x: (B, H, W, C)
         B, H, W, C = x.shape
         
-        # 채널 3분할
+        # 채널 3분할 (S, V, B)
         s, v, b = torch.chunk(x, 3, dim=-1)
         
         # 1. 불변량 추출
@@ -301,14 +358,18 @@ class GeometricDescriptorGuidance(nn.Module):
         
         return torch.cat([s_mod, v_mod, b_mod], dim=-1)
 
+
 class GeometricEncoderBlock(nn.Module):
+    """
+    [Stage 2. 인코더 블록]
+    
+    Architecture.md §3.2 전체 흐름
+    
+    CPE -> Rotor-Scale Attention -> Guidance -> FFN
+    """
     def __init__(self, dim):
-        """
-        [Stage 2. 인코더 블록]
-        CPE -> Rotor-Scale Attention -> Guidance -> FFN
-        """
         super().__init__()
-        self.cpe = GeometricCPE(dim) # Position Injection
+        self.cpe = GeometricCPE(dim)
         self.norm1 = nn.LayerNorm(dim)
         self.attn = RotorScaleAttention(dim)
         self.norm2 = nn.LayerNorm(dim)
@@ -332,16 +393,20 @@ class GeometricEncoderBlock(nn.Module):
         
         return x
 
+
 # =============================================================================
 # [Stage 3] Decoder Components
 # =============================================================================
 
 class DenseRotorHead(nn.Module):
+    """
+    [Stage 3.1 Dense Rotor Regression Head]
+    
+    Architecture.md §3.3.1 - Cross-Attention Output Head
+    
+    Dense Rotor Map: (Cos, Sin, dx, dy) 출력
+    """
     def __init__(self, in_dim):
-        """
-        [Stage 3.1 Cross-Attention Output Head]
-        Dense Rotor Regression Head: (Cos, Sin, dx, dy)
-        """
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(in_dim, in_dim // 2),
@@ -352,25 +417,26 @@ class DenseRotorHead(nn.Module):
     def forward(self, x):
         return self.net(x)
 
+
 class GeometricCrossAttention(nn.Module):
-    def __init__(self, dim, num_heads=4):
-        """
-        [Stage 3.1 Cross-Attention]
-        이미지 A(Query)와 B(Key/Value)를 대조하여 Rotor를 추출합니다.
-        IndependentLinear를 사용하여 S, V, B 채널 독립성을 유지합니다.
-        """
+    """
+    [Stage 3.1 Cross-Attention]
+    
+    Architecture.md §3.3.1 - Cross-Attention
+    
+    이미지 A(Query)와 B(Key/Value)를 대조하여 Rotor를 추출합니다.
+    IndependentLinear를 사용하여 S, V, B 채널 독립성을 유지합니다.
+    """
+    def __init__(self, dim, num_heads=NUM_ATTENTION_HEADS):
         super().__init__()
         self.num_heads = num_heads
         self.dim = dim
 
-        # [Logic Fix] IndependentLinear 사용
         self.to_q = IndependentLinear(dim)
         self.to_k = IndependentLinear(dim)
         self.to_v = IndependentLinear(dim)
         
         self.rotor_head = DenseRotorHead(dim)
-        
-        # [Logic Fix] 출력단 독립성 유지
         self.proj = IndependentLinear(dim)
 
     def forward(self, x_a, x_b):
@@ -381,10 +447,9 @@ class GeometricCrossAttention(nn.Module):
         k = self.to_k(x_b.view(B, N, C)).view(B, N, self.num_heads, C // self.num_heads).transpose(1, 2)
         v = self.to_v(x_b.view(B, N, C)).view(B, N, self.num_heads, C // self.num_heads).transpose(1, 2)
         
-        # [CUDA 최적화] Flash Attention 적용
+        # Flash Attention
         out = F.scaled_dot_product_attention(q, k, v)
         
-        # Context Vector
         context = out.transpose(1, 2).reshape(B, H, W, C)
         
         # [Dense Rotor Regression]
@@ -392,47 +457,49 @@ class GeometricCrossAttention(nn.Module):
         
         return self.proj(context), dense_rotor
 
+
 class CliffordInterpolation(nn.Module):
+    """
+    [Stage 3.2 Clifford Interpolation]
+    
+    Architecture.md §3.3.2 - Clifford Interpolation
+    
+    - Scalar: 부드러운 선형 보간
+    - Vector: 방향성을 유지하며 보간
+    - Rotor(Bivector): 보간 후 정규화(NLERP)로 회전 성질 복원
+    """
     def __init__(self, scale_factor=2):
-        """
-        [Stage 3.2 Clifford Interpolation]
-        - Scalar: 부드러운 선형 보간
-        - Vector: 방향성을 유지하며 보간
-        - Rotor(Bivector): 보간 후 정규화(NLERP)로 회전 성질 복원
-        """
         super().__init__()
         self.scale_factor = scale_factor
 
     def forward(self, x):
         # x: (B, C, H, W) -> C는 3의 배수 (S, V, B 그룹)
-        
-        # 1. 성분 분리 (Split)
         s, v, b = torch.chunk(x, 3, dim=1)
         
-        # 2. 업샘플링 (Upsampling)
+        # 업샘플링
         s_up = F.interpolate(s, scale_factor=self.scale_factor, mode='bilinear', align_corners=True)
         v_up = F.interpolate(v, scale_factor=self.scale_factor, mode='bilinear', align_corners=True)
         b_up = F.interpolate(b, scale_factor=self.scale_factor, mode='bilinear', align_corners=True)
         
-        # 3. 기하학적 보정 (Geometric Correction)
         # [Rotor Correction] NLERP: 정규화하여 회전 정보(Unit) 복원
         b_up = F.normalize(b_up, dim=1)
         
-        # 4. 재결합 (Concat)
         return torch.cat([s_up, v_up, b_up], dim=1)
 
-class GeometricSkipConnection(nn.Module):
-    def __init__(self, dim):
-        """
-        [Stage 3.3 Geometric Skip-Connection]
-        1. 정렬: Rotor Map을 이용해 인코더 피쳐를 Warping
-        2. 융합: Concat
-        """
-        super().__init__()
 
-        # 단순 Conv 대신 Residual + Dilated + SE 적용
+class GeometricSkipConnection(nn.Module):
+    """
+    [Stage 3.3 Geometric Skip-Connection]
+    
+    Architecture.md §3.3.3 - Geometric Skip-Connection
+    
+    1. 정렬: Rotor Map을 이용해 인코더 피처를 Warping
+    2. 융합: Concat 후 압축 및 정제
+    """
+    def __init__(self, dim):
+        super().__init__()
         self.fusion = GeometricResBlock(dim, dilation=2) 
-        self.compress = nn.Conv2d(dim * 2, dim, 1) # 채널 축소용
+        self.compress = nn.Conv2d(dim * 2, dim, 1)
 
     def get_warp_grid(self, rotor_map, B, H, W, device):
         """
@@ -463,50 +530,66 @@ class GeometricSkipConnection(nn.Module):
         grid = self.get_warp_grid(rotor_map, B, H, W, enc_feat.device)
         warped_enc = F.grid_sample(enc_feat, grid, align_corners=True, mode='bilinear', padding_mode='zeros')
         
-        # 2. 융합 (Concat -> Compress -> Powerful Refinement (Res+Dilated+SE))
+        # 2. 융합 (Concat -> Compress -> Refinement)
         concat = torch.cat([dec_feat, warped_enc], dim=1)
         fused = self.compress(concat)
         
         return fused
+
 
 # =============================================================================
 # [Main Wrapper] Phase 3 Transformer
 # =============================================================================
 
 class Phase3Transformer(nn.Module):
-    def __init__(self, feature_dim=384, num_layers=2):
+    """
+    [Phase 3 메인 클래스]
+    
+    Architecture.md §3 전체 구현
+    
+    Coarse-to-Fine Transform Propagation:
+    저해상도에서 추정한 Global Transform을 고해상도로 전파하여
+    "큰 변환 → 작은 잔차" 순으로 처리합니다.
+    """
+    
+    def __init__(self, feature_dim=FEATURE_DIM, num_layers=NUM_ENCODER_LAYERS, embed_dim=HIDDEN_DIM):
         """
-        [Phase 3 Main Module]
-        Phase 2의 피라미드를 입력받아 인코딩 및 디코딩 수행.
-        하이퍼파라미터
-            - feature_dim: 384 등으로 늘리면 표현력이 좋아짐 (단, 3의 배수 유지 필수)
+        Args:
+            feature_dim: 트랜스포머 내부 연산 차원 (기본 144)
+            num_layers: Encoder 블록 수 (기본 2)
+            embed_dim: Phase 2에서 넘어오는 차원 (기본 48)
         """
         super().__init__()
         self.feature_dim = feature_dim
         
-        # Phase 2 Output Adapters
-        self.adapt_s = nn.Conv2d(64, feature_dim // 3, 1)
-        self.adapt_v_proj = nn.Conv2d(128, feature_dim // 3, 1)
-        self.adapt_b = nn.Conv2d(64, feature_dim // 3, 1)
+        # [Input Alignment] S, V, B 차원 정렬
+        # S(1개), V(2배), B(1개) 구조
+        self.adapt_s = nn.Conv2d(embed_dim, feature_dim // 3, 1)
+        self.adapt_v_proj = nn.Conv2d(embed_dim * 2, feature_dim // 3, 1)
+        self.adapt_b = nn.Conv2d(embed_dim, feature_dim // 3, 1)
         
+        # [Stage 1] Tokenization
         self.tokenizer = GeometricTokenizer(in_channels=feature_dim, hidden_dim=feature_dim)
         
+        # [Stage 2] Encoder
         self.encoder_layers = nn.ModuleList([
             GeometricEncoderBlock(feature_dim) for _ in range(num_layers)
         ])
         
+        # [Stage 3] Decoder
         self.cross_attn = GeometricCrossAttention(feature_dim)
         self.upsampler = CliffordInterpolation()
         self.skip_conn = GeometricSkipConnection(feature_dim)
         
+        # [Stage 3.4] Final Output
         self.final_net = nn.Sequential(
             GeometricResBlock(feature_dim, dilation=1),
-            nn.Conv2d(feature_dim, 4, 1)
+            nn.Conv2d(feature_dim, 4, 1)  # (Energy, Vx, Vy, Rotation)
         )
 
     def prepare_input(self, p2_out):
         """
-        Phase 2 Output(Tuple)을 Phase 3 Input Tensor로 변환
+        [Helper] Phase 2 Output → Phase 3 Input 변환
         """
         s, v, b = p2_out
         v_flat = v.view(v.shape[0], -1, v.shape[-2], v.shape[-1])
@@ -520,49 +603,47 @@ class Phase3Transformer(nn.Module):
 
     def forward(self, pyramid_a, pyramid_b):
         """
-        [Stage 3.4 Feature Map Generation] 
+        [Phase 3 Forward - Stage 3.4 Feature Map Generation]
+        
+        Architecture.md §3.3.4
+        
         Coarse(Transformer) to Fine(Skip-Refinement) 루프를 수행합니다.
-        속도 향상을 위해 고해상도(Level 0, 1)에서는 무거운 Attention 연산을 생략하고 
-        상위 레벨의 문맥을 보간하여 사용.
+        고해상도(Level 0, 1)에서는 무거운 Attention 연산을 생략하고 
+        상위 레벨의 문맥을 보간하여 사용합니다.
+        
+        Returns:
+            list of dict: [{level, rotor_map, mpc_map}, ...]
         """
         results = []
         dec_feat, last_rotor = None, None
         
-        # [Visual Fix] tqdm으로 전체 레벨 진행상황 표시
-        level_iter = tqdm(reversed(range(len(pyramid_a))), total=len(pyramid_a), desc="Phase 3: Pyramid Levels")
-        
-        for i in level_iter:
-            # 현재 어떤 연산 방식이 사용되는지 tqdm 설명에 표시
-            mode_str = "(Transformer)" if i >= 2 else "(CNN Refine)"
-            level_iter.set_description(f"Phase 3: Level {i} {mode_str}")
+        # Coarse to Fine 순회
+        for i in reversed(range(len(pyramid_a))):
             raw_a = self.prepare_input(pyramid_a[i])
             
-            # --- [Stage 2.3 속도 최적화: 연산 분기] ---
-            if i >= 2:
+            # --- [속도 최적화: 연산 분기] ---
+            if i >= HIGH_RES_SKIP_LEVEL:
                 # 저해상도: 전역 문맥 파악을 위해 Transformer Encoder/Cross-Attention 실행
                 raw_b = self.prepare_input(pyramid_b[i])
                 tok_a = self.tokenizer(raw_a).permute(0, 2, 3, 1)
                 tok_b = self.tokenizer(raw_b).permute(0, 2, 3, 1)
                 
                 for layer in self.encoder_layers:
-                    # Gradient Checkpointing으로 메모리 절약 유지
                     tok_a = checkpoint(layer, tok_a, pyramid_a[i][2], use_reentrant=False)
                     tok_b = checkpoint(layer, tok_b, pyramid_b[i][2], use_reentrant=False)
                 
-                # Cross-Attention을 통해 새로운 매칭 정보(Rotor) 추출
+                # [§3.3.1] Cross-Attention으로 매칭 정보(Rotor) 추출
                 ctx, last_rotor = self.cross_attn(tok_a, tok_b)
                 dec_feat_chw = ctx.permute(0, 3, 1, 2)
             else:
-                # 고해상도(Level 0, 1): 연산량 폭증을 막기 위해 Attention 생략
-                # 대신 상위 레벨의 디코더 특징(dec_feat)을 Clifford Interpolation으로 가져옴 [Stage 3.2]
+                # 고해상도(Level 0, 1): Attention 생략, 상위 레벨 문맥 보간
                 dec_feat_up = self.upsampler(dec_feat)
                 
-                # 타겟 해상도와 미세한 차이가 있을 경우 Bilinear로 최종 조정
                 if dec_feat_up.shape[-2:] != raw_a.shape[-2:]:
                     dec_feat_up = F.interpolate(dec_feat_up, size=raw_a.shape[-2:], mode='bilinear', align_corners=True)
                 dec_feat_chw = dec_feat_up
                 
-                # 상위 레벨의 Rotor Map도 현재 해상도에 맞게 보간 (Warping용)
+                # Rotor Map도 보간
                 last_rotor = F.interpolate(
                     last_rotor.permute(0, 3, 1, 2), 
                     size=raw_a.shape[-2:], 
@@ -570,15 +651,12 @@ class Phase3Transformer(nn.Module):
                     align_corners=True
                 ).permute(0, 2, 3, 1)
 
-            # --- [Stage 3.3 Geometric Skip-Connection] ---
-            # 보간된 문맥(또는 Transformer 결과)과 현재 레벨의 원본(raw_a)을 Warping 후 융합
+            # --- [§3.3.3 Geometric Skip-Connection] ---
             fused = self.skip_conn(dec_feat_chw, raw_a, last_rotor)
             
-            # --- [Stage 3.4 최종 맵 생성] ---
-            # CNN 레이어를 통해 노이즈 제거 및 MPC용 Feature Map 출력
+            # --- [§3.3.4 최종 맵 생성] ---
             mpc_map = self.final_net(fused)
             
-            # 다음(하위) 레벨을 위한 상태 업데이트
             dec_feat = fused
             
             results.append({
@@ -589,11 +667,15 @@ class Phase3Transformer(nn.Module):
             
         return results
 
+
 # =============================================================================
-# 실행 및 검증 코드 (Visualization)
+# 시각화 및 테스트
 # =============================================================================
 
 def visualize_phase3_results(results):
+    """
+    [Phase 3 시각화]
+    """
     levels = len(results)
     plt.figure(figsize=(15, 4 * levels))
     plt.suptitle("Phase 3: Coarse-to-Fine Geometric Matching Analysis", fontsize=18, fontweight='bold')
@@ -646,6 +728,7 @@ def visualize_phase3_results(results):
     plt.tight_layout()
     plt.show()
 
+
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Phase 3 Running on: {device}")
@@ -660,13 +743,13 @@ if __name__ == "__main__":
         pyramid_raw = preprocessor.process_pyramid(img_rgb, levels=6)
         print(f"Phase 1 Complete. Levels: {len(pyramid_raw)}")
         
-        embedder = CliffordPyramidEmbedder(hidden_dim=64).to(device)
+        embedder = CliffordPyramidEmbedder(hidden_dim=HIDDEN_DIM).to(device)
         with torch.no_grad():
             pyramid_a = embedder(pyramid_raw, device)
             pyramid_b = embedder(pyramid_raw, device)
         print(f"Phase 2 Complete.")
         
-        model = Phase3Transformer(feature_dim=192).to(device)
+        model = Phase3Transformer(feature_dim=FEATURE_DIM, embed_dim=HIDDEN_DIM).to(device)
         
         with torch.no_grad():
             results = model(pyramid_a, pyramid_b)
