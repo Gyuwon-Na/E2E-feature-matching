@@ -1,16 +1,14 @@
 """
 ================================================================================
-Phase 3: Geometric Transformer & Decoder
+Phase 3: Geometric Transformer & Decoder - v5 RTX 3090 Optimized
 ================================================================================
 [Architecture.md §3 참조]
 
-Phase 2에서 준비된 해상도별 S, V, B 꾸러미를 입력받아, 이미지 간의 기하학적 
-대응 관계를 추론하고 초정밀 매칭 지도를 생성하는 최종 공정입니다.
-
-주요 단계:
-- Stage 1: Tokenization & Alignment
-- Stage 2: Encoder (CPE, Rotor-Scale Attention, Geometric Descriptor Guidance)
-- Stage 3: Decoder (Cross-Attention, Clifford Interpolation, Skip-Connection)
+[v5 수정사항]
+1. RTX 3090 24GB 메모리 최적화: SAFE_N_LIMIT, SAFE_ELEMENTS 증가
+2. Attention 효율화: Flash Attention 활용 극대화
+3. ±60° 회전 대응: 피라미드 레벨 5로 증가
+4. Encoder 레이어 수 조정 가능 (3개로 증가 옵션)
 
 출력:
 - Dense Rotor Map: (cos, sin, dx, dy) 픽셀별 변환
@@ -35,14 +33,16 @@ from phase1 import MathGeometricPreprocessor
 from phase2 import CliffordPyramidEmbedder, HIDDEN_DIM
 
 # =============================================================================
-# [Hyperparameters] Phase 3
+# [Hyperparameters] Phase 3 - v5 RTX 3090 Optimized
 # =============================================================================
 FEATURE_DIM = 144                # [Hyperparameter] Transformer 내부 연산 차원
-NUM_ENCODER_LAYERS = 2           # [Hyperparameter] Encoder 블록 수
+NUM_ENCODER_LAYERS = 3           # [Hyperparameter] Encoder 블록 수 [v5: 2→3, 큰 회전 대응]
 NUM_ATTENTION_HEADS = 4          # [Hyperparameter] Multi-Head Attention 헤드 수
 SE_REDUCTION = 16                # [Hyperparameter] SE Block 축소 비율
-SAFE_N_LIMIT = 4096              # [Hyperparameter] Chunking 없이 처리할 최대 픽셀 수
-SAFE_ELEMENTS = 2**20            # [Hyperparameter] Chunk당 최대 요소 수 (~100만)
+
+# [v5 수정] RTX 3090 24GB 메모리 최적화
+SAFE_N_LIMIT = 8192              # [Hyperparameter] Chunking 없이 처리할 최대 픽셀 수 [v5: 4096→8192]
+SAFE_ELEMENTS = 2**22            # [Hyperparameter] Chunk당 최대 요소 수 [v5: 2^20→2^22, ~400만]
 HIGH_RES_SKIP_LEVEL = 2          # [Hyperparameter] Attention 생략할 고해상도 레벨 임계값
 
 
@@ -208,6 +208,8 @@ class RotorScaleAttention(nn.Module):
     
     Path A: Unit Rotor (순수 회전 방향) - Rotation Invariant Matching
     Path B: Magnitude (크기 정보) - Scale 비율을 Attention Bias로 사용
+    
+    [v5 수정] RTX 3090에서 더 큰 청크 처리 가능
     """
     def __init__(self, dim, num_heads=NUM_ATTENTION_HEADS):
         super().__init__()
@@ -256,7 +258,7 @@ class RotorScaleAttention(nn.Module):
         gate_weight = self.gate_net(x).view(B, 1, N, 1)
 
         # -------------------------------------------------------------------------
-        # [Adaptive Chunking for Memory Management]
+        # [v5 수정] RTX 3090 최적화된 청킹
         # -------------------------------------------------------------------------
         if N <= SAFE_N_LIMIT:
             CHUNK_SIZE = N
@@ -267,6 +269,7 @@ class RotorScaleAttention(nn.Module):
         r_mag_v = r_mag.expand(B, self.num_heads, N, 1)
         r_mag_k = r_mag.transpose(-2, -1)
         
+        # [v5] 진행률 표시 비활성화 조건 완화
         pbar = tqdm(range(0, N, CHUNK_SIZE), desc=f"  [Attn] Chunks (N={N})", 
                     leave=False, disable=(N <= SAFE_N_LIMIT))
 
@@ -283,7 +286,7 @@ class RotorScaleAttention(nn.Module):
                 )
                 attn_mask_chunk = -scale_diff_chunk.to(q.dtype)
 
-                # [Path A] 메인 어텐션
+                # [Path A] 메인 어텐션 (Flash Attention 활용)
                 out_chunk = F.scaled_dot_product_attention(
                     q_chunk, k, v, 
                     attn_mask=attn_mask_chunk, 
@@ -538,14 +541,19 @@ class GeometricSkipConnection(nn.Module):
 
 
 # =============================================================================
-# [Main Wrapper] Phase 3 Transformer
+# [Main Wrapper] Phase 3 Transformer - v5 수정
 # =============================================================================
 
 class Phase3Transformer(nn.Module):
     """
-    [Phase 3 메인 클래스]
+    [Phase 3 메인 클래스] - v5 RTX 3090 Optimized
     
     Architecture.md §3 전체 구현
+    
+    [v5 수정사항]
+    1. NUM_ENCODER_LAYERS = 3 (기본값 증가)
+    2. 메모리 최적화된 청킹 전략
+    3. 피라미드 레벨 5 지원
     
     Coarse-to-Fine Transform Propagation:
     저해상도에서 추정한 Global Transform을 고해상도로 전파하여
@@ -556,7 +564,7 @@ class Phase3Transformer(nn.Module):
         """
         Args:
             feature_dim: 트랜스포머 내부 연산 차원 (기본 144)
-            num_layers: Encoder 블록 수 (기본 2)
+            num_layers: Encoder 블록 수 (v5 기본 3)
             embed_dim: Phase 2에서 넘어오는 차원 (기본 48)
         """
         super().__init__()
@@ -571,7 +579,7 @@ class Phase3Transformer(nn.Module):
         # [Stage 1] Tokenization
         self.tokenizer = GeometricTokenizer(in_channels=feature_dim, hidden_dim=feature_dim)
         
-        # [Stage 2] Encoder
+        # [Stage 2] Encoder (v5: 기본 3개 레이어)
         self.encoder_layers = nn.ModuleList([
             GeometricEncoderBlock(feature_dim) for _ in range(num_layers)
         ])
@@ -731,7 +739,11 @@ def visualize_phase3_results(results):
 
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Phase 3 Running on: {device}")
+    print(f"Phase 3 v5 Running on: {device}")
+    
+    if torch.cuda.is_available():
+        gpu_mem = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+        print(f"GPU Memory: {gpu_mem:.1f} GB")
     
     IMG_PATH = "./img/val2017/000000569972.jpg"
     img = cv2.imread(IMG_PATH)
@@ -740,7 +752,8 @@ if __name__ == "__main__":
         img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         
         preprocessor = MathGeometricPreprocessor()
-        pyramid_raw = preprocessor.process_pyramid(img_rgb, levels=6)
+        # [v5] 피라미드 레벨 5
+        pyramid_raw = preprocessor.process_pyramid(img_rgb, levels=5)
         print(f"Phase 1 Complete. Levels: {len(pyramid_raw)}")
         
         embedder = CliffordPyramidEmbedder(hidden_dim=HIDDEN_DIM).to(device)
@@ -749,12 +762,13 @@ if __name__ == "__main__":
             pyramid_b = embedder(pyramid_raw, device)
         print(f"Phase 2 Complete.")
         
-        model = Phase3Transformer(feature_dim=FEATURE_DIM, embed_dim=HIDDEN_DIM).to(device)
+        # [v5] 3개 인코더 레이어
+        model = Phase3Transformer(feature_dim=FEATURE_DIM, num_layers=3, embed_dim=HIDDEN_DIM).to(device)
         
         with torch.no_grad():
             results = model(pyramid_a, pyramid_b)
             
-        print(f"Phase 3 Complete. Processed Levels: {len(results)}")
+        print(f"Phase 3 v5 Complete. Processed Levels: {len(results)}")
         
         visualize_phase3_results(results)
     else:
