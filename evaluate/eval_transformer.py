@@ -22,12 +22,17 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 
+import sys
+
+current_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(current_dir)
+sys.path.append(parent_dir)
 # 프로젝트 모듈 임포트
-from phase1 import MathGeometricPreprocessor
-from phase2 import CliffordPyramidEmbedder, HIDDEN_DIM
-from phase3 import Phase3Transformer, FEATURE_DIM
-from fine_tune import GeometricRotationDataset, collate_fn_geometric, IMG_SIZE
-from losses import normalize_rotor_output
+from pipeline.phase1 import MathGeometricPreprocessor
+from pipeline.phase2 import CliffordPyramidEmbedder, HIDDEN_DIM
+from pipeline.phase3 import Phase3Transformer, FEATURE_DIM
+from train.fine_tune import GeometricRotationDataset, collate_fn_geometric, IMG_SIZE
+from train.losses import normalize_rotor_output
 
 # =============================================================================
 # [Helper] 유틸리티 함수

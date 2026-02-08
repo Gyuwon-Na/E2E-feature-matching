@@ -7,25 +7,37 @@ import time
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 
+import sys
+
+current_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(current_dir)
+sys.path.append(parent_dir)
+
 # ==============================================================================
 # [Import Area] 비교할 Phase 4 모듈들을 여기서 가져오세요
 # ==============================================================================
-from phase1 import MathGeometricPreprocessor
-from phase2 import CliffordPyramidEmbedder
-from phase3 import Phase3Transformer
+from pipeline.phase1 import MathGeometricPreprocessor
+from pipeline.phase2 import CliffordPyramidEmbedder
+from pipeline.phase3 import Phase3Transformer
 
-# 예시: 개발 중인 다양한 Refiner들을 import
-# from phase4_v1 import HierarchicalMPCRefiner as RefinerV1
-# from phase4_v2 import HierarchicalMPCRefiner as RefinerV2
-from phase4_1 import HierarchicalMPCRefiner as RefinerBase # 현재 버전 (예시)
-from phase4_2 import HierarchicalMPCRefiner as RefinerV2
-from phase4_3 import HierarchicalMPCRefiner as RefinerV3
+# Import all refiner variants
+from phase4.phase4_1 import HierarchicalMPCRefiner as RefinerBase
+from phase4.phase4_2 import HierarchicalMPCRefiner as RefinerV2
+from phase4.phase4_3 import HierarchicalMPCRefiner as RefinerV3
+
+# NEW: Import proposed solutions
+import sys
+sys.path.insert(0, '/home/claude')
+from phase4.phase4_ensemble import EnsembleMPCRefiner
+from phase4.phase4_dynamic import DynamicScoutRefiner
 
 # 비교할 후보군 등록 (이름, 클래스)
 CANDIDATES = [
-    ("Baseline (V1)", RefinerBase), 
-    ("Advanced (V2)", RefinerV2),  # 추가할 때 주석 해제
-    ("Experimental", RefinerV3),
+    ("V1 Baseline", RefinerBase), 
+    ("V2 Advanced", RefinerV2),
+    ("V3 Scout", RefinerV3),
+    ("Ensemble", EnsembleMPCRefiner),      # Solution 2
+    ("Dynamic", DynamicScoutRefiner),       # Solution 3
 ]
 
 # ==============================================================================
@@ -35,7 +47,7 @@ IMG_SIZE = (256, 256)
 HIDDEN_DIM = 48
 FEATURE_DIM = 144
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-MODEL_PATH = "./checkpoints/best_model.pth"
+MODEL_PATH = "./checkpoints/last_model.pth"
 TEST_IMG_DIR = "./img/val2017"
 ANGLE_THRESHOLD = 60.0
 

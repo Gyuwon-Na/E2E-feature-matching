@@ -25,7 +25,15 @@ import numpy as np
 import cv2
 import matplotlib.pyplot as plt
 
-from phase1 import MathGeometricPreprocessor
+
+import sys
+import os
+current_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(current_dir)
+sys.path.append(parent_dir)
+
+
+from pipeline.phase1 import MathGeometricPreprocessor
 
 # =============================================================================
 # [Hyperparameters] Phase 2

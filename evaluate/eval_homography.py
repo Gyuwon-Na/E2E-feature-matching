@@ -7,11 +7,17 @@ import matplotlib.pyplot as plt
 import glob
 from tqdm import tqdm
 
+import sys
+
+current_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(current_dir)
+sys.path.append(parent_dir)
+
 # 프로젝트 모듈 임포트
-from phase1 import MathGeometricPreprocessor
-from phase2 import CliffordPyramidEmbedder
-from phase3 import Phase3Transformer
-from phase4 import HierarchicalMPCRefiner  # [v2] Hierarchical Refiner 사용
+from pipeline.phase1 import MathGeometricPreprocessor
+from pipeline.phase2 import CliffordPyramidEmbedder
+from pipeline.phase3 import Phase3Transformer
+from phase4.from phase4.phase4_1 import HierarchicalMPCRefiner  # [v2] Hierarchical Refiner 사용
 
 # ==============================================================================
 # [Configuration] 

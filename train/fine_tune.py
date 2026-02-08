@@ -40,6 +40,13 @@ import time
 import json
 import math
 
+
+import os
+current_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(current_dir)
+sys.path.append(parent_dir)
+
+
 # =============================================================================
 # [Hyperparameters] Training Configuration - RTX 3090 24GB Optimized
 # =============================================================================
@@ -326,7 +333,7 @@ class GeometricRotationDataset(Dataset):
     def _get_preprocessor(self):
         """지연 로딩으로 메모리 효율화"""
         if self.preprocessor is None:
-            from phase1 import MathGeometricPreprocessor
+            from pipeline.phase1 import MathGeometricPreprocessor
             self.preprocessor = MathGeometricPreprocessor()
         return self.preprocessor
     
@@ -752,8 +759,8 @@ def train(img_dir, resume_from=None, debug_mode=False):
     # ==========================================================================
     print("\n🏗️ Building Model...")
     
-    from phase2 import CliffordPyramidEmbedder
-    from phase3 import Phase3Transformer
+    from pipeline.phase2 import CliffordPyramidEmbedder
+    from pipeline.phase3 import Phase3Transformer
     from losses import UnifiedGeometricLoss
     
     embedder = CliffordPyramidEmbedder(hidden_dim=HIDDEN_DIM).to(device)
@@ -944,8 +951,8 @@ def quick_test(img_dir, checkpoint_path=None, test_angles=[15, 30, 45, 60]):
     device_info = setup_device()
     device = device_info['device']
     
-    from phase2 import CliffordPyramidEmbedder
-    from phase3 import Phase3Transformer
+    from pipeline.phase2 import CliffordPyramidEmbedder
+    from pipeline.phase3 import Phase3Transformer
     
     embedder = CliffordPyramidEmbedder(hidden_dim=HIDDEN_DIM).to(device)
     transformer = Phase3Transformer(feature_dim=FEATURE_DIM, embed_dim=HIDDEN_DIM).to(device)

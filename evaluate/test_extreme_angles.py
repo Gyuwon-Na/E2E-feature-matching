@@ -7,10 +7,16 @@ import cv2
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
-from phase1 import MathGeometricPreprocessor
-from phase2 import CliffordPyramidEmbedder, HIDDEN_DIM
-from phase3 import Phase3Transformer, FEATURE_DIM
-from phase4 import HierarchicalMPCRefiner  # v5 적용됨
+
+import sys
+current_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(current_dir)
+sys.path.append(parent_dir)
+
+from pipeline.phase1 import MathGeometricPreprocessor
+from pipeline.phase2 import CliffordPyramidEmbedder, HIDDEN_DIM
+from pipeline.phase3 import Phase3Transformer, FEATURE_DIM
+from phase4.phase4_1 import HierarchicalMPCRefiner  # v5 적용됨
 
 # ==============================================================================
 # [Settings]

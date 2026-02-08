@@ -29,8 +29,16 @@ import cv2
 from torch.utils.checkpoint import checkpoint
 from tqdm import tqdm
 
-from phase1 import MathGeometricPreprocessor
-from phase2 import CliffordPyramidEmbedder, HIDDEN_DIM
+
+import sys
+import os
+current_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(current_dir)
+sys.path.append(parent_dir)
+
+
+from pipeline.phase1 import MathGeometricPreprocessor
+from pipeline.phase2 import CliffordPyramidEmbedder, HIDDEN_DIM
 
 # =============================================================================
 # [Hyperparameters] Phase 3 - v5 RTX 3090 Optimized

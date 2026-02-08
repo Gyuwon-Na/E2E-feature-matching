@@ -29,6 +29,11 @@ except ImportError:
     print("❌ kornia가 설치되지 않았습니다. 'pip install kornia'를 실행하세요.")
     exit()
 
+import sys
+
+current_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(current_dir)
+sys.path.append(parent_dir)
 # =============================================================================
 # [Configuration] 
 # =============================================================================
