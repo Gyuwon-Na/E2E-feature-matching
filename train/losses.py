@@ -28,26 +28,20 @@ sys.path.append(parent_dir)
 # =============================================================================
 # [Hyperparameters] Loss Function - v5 ±60° Optimized
 # =============================================================================
-# [Geometric Accuracy 가중치]
-LAMBDA_SCALAR = 1.0              # [Hyperparameter] L_s 가중치
-LAMBDA_VECTOR = 1.0              # [Hyperparameter] L_v 가중치
-LAMBDA_BIVECTOR = 1.0            # [Hyperparameter] L_b 가중치
+# 가중치 재조정 (losses.py)
+LAMBDA_SCALAR = 1.0      
+LAMBDA_VECTOR = 45.0      # 50 → 30 (벡터 압박 완화)
+LAMBDA_BIVECTOR = 700.0   # 1000 → 300 (Rotor 제약 완화)
 
-# [Final Consistency 가중치] - v5 수정
-BETA_COORD = 10.0                # [Hyperparameter] L_coord 가중치
-LAMBDA_ANGLE = 50.0              # [Hyperparameter] L_angle 가중치 [v5: 35→50, ±60° 대응]
-LAMBDA_PIXEL = 0.5               # [Hyperparameter] L_pixel 가중치
+BETA_COORD = 10.0         
+LAMBDA_ANGLE = 1500.0      # 2000 → 800 (각도 압박 완화)
+LAMBDA_PIXEL = 0.05       
 
-# [v5 신규] 회전 불변 손실
-LAMBDA_ROTATION_INV = 0.5        # [Hyperparameter] L_rotation_invariant 가중치
+LAMBDA_ROTATION_INV = 450.0  # 800 → 200 (회전 불변성 완화)
+SMOOTH_L1_BETA = 2.5      # 2.0 → 3.0 (큰 오차 더 관용)
 
-# [Iterative Stability 가중치]
-GAMMA_CONVERGENCE = 0.1          # [Hyperparameter] L_convergence 가중치
-GAMMA_MULTISCALE = 0.1           # [Hyperparameter] L_multi_scale 가중치
-
-# [SmoothL1 Beta] - v5 수정
-SMOOTH_L1_BETA = 0.3             # [Hyperparameter] SmoothL1 beta [v5: 0.5→0.8, 큰 오차 관용]
-
+GAMMA_CONVERGENCE = 0.5
+GAMMA_MULTISCALE = 0.3
 
 class GeometricAccuracyLoss(nn.Module):
     """

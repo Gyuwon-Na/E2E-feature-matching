@@ -51,7 +51,7 @@ sys.path.append(parent_dir)
 # [Hyperparameters] Training Configuration - RTX 3090 24GB Optimized
 # =============================================================================
 IMG_SIZE = (256, 256)            # [Hyperparameter] 입력 이미지 크기
-MAX_SAMPLES = 5000               # [Hyperparameter] 최대 학습 샘플 수 (5000장)
+MAX_SAMPLES_NUM = 2000               # [Hyperparameter] 최대 학습 샘플 수 (5000장)
 LIMIT_SAMPLE_NUM = 300           # [Hyperparameter] 디버그 모드 샘플 수
 
 # [v5 수정] ±60도 회전 범위 (커리큘럼으로 점진 증가)
@@ -283,7 +283,7 @@ class GeometricRotationDataset(Dataset):
     3. 피라미드 레벨 최적화 (4 → 5)
     """
     
-    def __init__(self, img_dir, is_train=True, max_samples=None,
+    def __init__(self, img_dir, is_train=True, max_samples=MAX_SAMPLES_NUM,
                  rot_min=-60.0, rot_max=60.0, curriculum_scheduler=None):
         """
         Args:
@@ -682,7 +682,7 @@ def train(img_dir, resume_from=None, debug_mode=False):
         run_epochs = 30  # 디버그용 짧은 에폭
         save_name_prefix = "debug_"
     else:
-        limit_samples = MAX_SAMPLES
+        limit_samples = MAX_SAMPLES_NUM
         run_epochs = NUM_EPOCHS
         save_name_prefix = "v5_60deg_"
     
@@ -769,6 +769,9 @@ def train(img_dir, resume_from=None, debug_mode=False):
     total_params = sum(p.numel() for p in embedder.parameters()) + \
                    sum(p.numel() for p in transformer.parameters())
     print(f"   Parameters: {total_params:,}")
+
+    start_epoch = 0
+    best_val_loss = float('inf')  # Best 점수 추적을 위한 변수
     
     # ==========================================================================
     # [4] Optimizer & Scheduler
@@ -811,10 +814,9 @@ def train(img_dir, resume_from=None, debug_mode=False):
         checkpoint = torch.load(resume_from, map_location=device, weights_only=False)
         embedder.load_state_dict(checkpoint['embedder'])
         transformer.load_state_dict(checkpoint['transformer'])
-        optimizer.load_state_dict(checkpoint['optimizer'])
-        start_epoch = checkpoint.get('epoch', 0) + 1
-        best_val_loss = checkpoint.get('best_val_loss', float('inf'))
-        print(f"   Resumed from epoch {start_epoch}")
+        # optimizer.load_state_dict(checkpoint['optimizer'])
+        start_epoch = 0  # 🔥 무조건 0부터 시작하도록 수정
+        best_val_loss = float('inf') # 검증 손실 기록도 초기화하는 것이 좋습니다.
         
         # 🔥 [추가] scheduler 상태 동기화
         scheduler.current_epoch = start_epoch
@@ -879,11 +881,34 @@ def train(img_dir, resume_from=None, debug_mode=False):
         if (epoch + 1) % VAL_INTERVAL == 0 or epoch == run_epochs - 1:
             val_metrics = validate(embedder, transformer, val_loader, criterion, device_info)
             
-            print(f"   [Val]   Loss: {val_metrics['loss_mean']:.4f} | "
+            # 🔥 [수정] 변수 정의: val_metrics에서 loss_mean을 추출하여 정의합니다.
+            current_val_loss = val_metrics['loss_mean']
+            
+            print(f"   [Val]   Loss: {current_val_loss:.4f} | "
                   f"Angle: {val_metrics['angle_error_mean']:.2f}° ± {val_metrics['angle_error_std']:.2f}° | "
                   f"Pixel: {val_metrics['pixel_error_mean']:.2f}px")
             
-            history['val_loss'].append(val_metrics['loss_mean'])
+            # =================================================================
+            # [Best Model 저장 로직] Loss 기준 최저점 저장
+            # =================================================================
+            if current_val_loss < best_val_loss:
+                best_val_loss = current_val_loss
+                torch.save({
+                    'epoch': epoch,
+                    'embedder': embedder.state_dict(),
+                    'transformer': transformer.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'best_val_loss': best_val_loss,
+                    'metrics': val_metrics,
+                    'training_config': {
+                        'version': 'v5_best',
+                        'rotation_range': current_rot
+                    }
+                }, os.path.join(CHECKPOINT_DIR, f'{save_name_prefix}best_model.pth'))
+                print(f"   🌟 Best Model Saved! (Loss: {best_val_loss:.4f})")
+
+            # history 업데이트 (current_val_loss 변수 사용)
+            history['val_loss'].append(current_val_loss)
             history['val_angle'].append(val_metrics['angle_error_mean'])
                    
         epoch_time = time.time() - epoch_start

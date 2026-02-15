@@ -125,19 +125,20 @@ def train_one_epoch_detailed(embedder, transformer, dataloader, optimizer, crite
     return metric_tracker.get_metrics()
 
 # =============================================================================
-# [Main Execution Setup]
+# [Main Execution Setup] - BOLD Strategy
 # =============================================================================
-# 1. 커리큘럼 재설정 (빠른 학습용)
+
+# 커리큘럼: ±90 → ±120도 (대담한 점프!)
 NEW_CURRICULUM_STAGES = [
-    (0,  20, 30.0, 45.0),   # 초반 20에폭: 30~45도 적응
-    (20, 50, 45.0, 60.0),   # 후반 30에폭: 45~60도 마스터
+    (0, 25, 90.0, 120.0)  # ✅ 수정: ±30도 점프
 ]
 
-# 2. 하이퍼파라미터 (안정적인 학습률)
-NEW_NUM_EPOCHS = 50
-NEW_LEARNING_RATE = 1e-4
-NEW_WARMUP_EPOCHS = 3
+# 하이퍼파라미터
+NEW_NUM_EPOCHS = 25           # ✅ 수정: 100 → 25
+NEW_LEARNING_RATE = 2e-5    # ✅ 수정: 2.5e-7 → 2.5e-5
+NEW_WARMUP_EPOCHS = 3         # ✅ 수정: 15 → 2
 NEW_VAL_INTERVAL = 1
+
 
 if __name__ == "__main__":
     import argparse
