@@ -34,7 +34,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 CHECKPOINT_DIR = "./checkpoints"
 IMG_DIR = "./img/val2017"
 NUM_EVAL_IMAGES = 5        # 공정한 평가를 위해 5장 평균
-ANGLES = list(range(-60, 60, 10)) # 0 ~ 180도, 15도 간격
+ANGLES = list(range(-180, 180, 10)) # 0 ~ 180도, 15도 간격
 
 # ==============================================================================
 # [Inference Helper]

@@ -23,7 +23,7 @@ from phase4.phase4_1 import HierarchicalMPCRefiner  # v5 적용됨
 # ==============================================================================
 # 테스트할 이미지 경로 (바꾸셔도 됩니다)
 IMG_PATH = "./img/val2017/000000010995.jpg" 
-MODEL_PATH = "./checkpoints/best_model.pth"
+MODEL_PATH = "./checkpoints/rot_90_1.32.pth"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # 테스트할 각도 리스트 (극한 상황 포함)
