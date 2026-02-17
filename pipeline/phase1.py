@@ -1,3 +1,63 @@
+# =============================================================================
+# Architecture.md Line Mapping (원본 architecture.md 기준)
+# - 각 라인이 코드의 어느 부분에 해당하는지 anchor로 명시합니다.
+# - (요청사항) architecture.md 내용을 스킵/생략하지 않기 위해, 빈 줄도 포함합니다.
+# =============================================================================
+# [ARCH L0001] (MathGeometricPreprocessor.process_pyramid / _extract_raw_features) ## **📂  1: Geometry Raw Data 추출 (Physical Raw Data Extraction)**
+# [ARCH L0002] (MathGeometricPreprocessor.process_pyramid / _extract_raw_features) 
+# [ARCH L0003] (MathGeometricPreprocessor.process_pyramid / _extract_raw_features) 이 단계에서는 원본 이미지를 다양한 해상도로 리사이즈한 후, 각 층에서 클리포드 멀티벡터의 재료가 될 물리량들을 추출
+# [ARCH L0004] (MathGeometricPreprocessor.process_pyramid / _extract_raw_features) 
+# [ARCH L0005] (MathGeometricPreprocessor.process_pyramid / _extract_raw_features) - **1/32 ~ 1/16 (Global):** 이미지의 아주 거친 형태만 보입니다. 큰 건물이나 산의 위치처럼 **전역적인 배치**를 파악하기 위함입니다.
+# [ARCH L0006] (MathGeometricPreprocessor.process_pyramid / _extract_raw_features) - **1/8 ~ 1/4 (Structural):** 물체의 구체적인 윤곽과 구조가 드러납니다. **주요 특징점들의 기하학적 관계**를 학습합니다.
+# [ARCH L0007] (MathGeometricPreprocessor.process_pyramid / _extract_raw_features) - **1/2 ~ 1 (Fine):** 아주 세밀한 텍스처와 0.1 픽셀 단위의 엣지가 보입니다. **최종적인 초정밀 정렬**을 수행하는 단계입니다.
+# [ARCH L0008] (MathGeometricPreprocessor.process_pyramid / _extract_raw_features) 
+# [ARCH L0009] (MathGeometricPreprocessor._extract_raw_features (Scalar: HSI/Structure/SDF)) ### **1. S (Scalar): 존재의 강도와 뼈대**
+# [ARCH L0010] (MathGeometricPreprocessor._extract_raw_features (Scalar: HSI/Structure/SDF)) 
+# [ARCH L0011] (MathGeometricPreprocessor._extract_raw_features (Scalar: HSI/Structure/SDF)) 스칼라는 방향성은 없지만, 해당 지점에 **"무엇이 얼마나 강하게 있는가"**를 나타냅니다.
+# [ARCH L0012] (MathGeometricPreprocessor._extract_raw_features (Scalar: HSI/Structure/SDF)) 
+# [ARCH L0013] (MathGeometricPreprocessor._extract_raw_features (Scalar: HSI/Structure/SDF)) - **Texture (재질/밝기)**
+# [ARCH L0014] (MathGeometricPreprocessor._extract_raw_features (Scalar: HSI/Structure/SDF))     - 이미지의 국부적인 밝기 변화를 의미
+# [ARCH L0015] (MathGeometricPreprocessor._extract_raw_features (Scalar: HSI/Structure/SDF))     - 물체의 표면 특성을 반영하며, 나중에 두 이미지 사이의 **색상 유사도**를 비교하는 기초 값이 됨
+# [ARCH L0016] (MathGeometricPreprocessor._extract_raw_features (Scalar: HSI/Structure/SDF)) - **Structure Energy (구조 에너지)**
+# [ARCH L0017] (MathGeometricPreprocessor._extract_raw_features (Scalar: HSI/Structure/SDF))     - 주변 픽셀들과 비교했을 때 정보가 얼마나 밀집되어 있는지를 나타냄
+# [ARCH L0018] (MathGeometricPreprocessor._extract_raw_features (Scalar: HSI/Structure/SDF))     - 매칭할 때 "믿을만한 특징점인가?"를 판단하는 **신뢰도 가중치**로 쓰임
+# [ARCH L0019] (MathGeometricPreprocessor._extract_raw_features (Scalar: HSI/Structure/SDF)) - **Edge Magnitude (엣지 세기)**
+# [ARCH L0020] (MathGeometricPreprocessor._extract_raw_features (Scalar: HSI/Structure/SDF))     - 경계선이 얼마나 뚜렷한지 나타내는 수치
+# [ARCH L0021] (MathGeometricPreprocessor._extract_raw_features (Scalar: HSI/Structure/SDF))     - V(Vector)가 방향을 가리킨다면, 이 값은 그 **방향의 확신도**를 결정
+# [ARCH L0022] (MathGeometricPreprocessor._extract_raw_features (Scalar: HSI/Structure/SDF)) - **SDF (Signed Distance Field)**
+# [ARCH L0023] (MathGeometricPreprocessor._extract_raw_features (Scalar: HSI/Structure/SDF))     - 물체의 뼈대로부터의 거리
+# [ARCH L0024] (MathGeometricPreprocessor._extract_raw_features (Scalar: HSI/Structure/SDF))     - **MPC(제어) 단계에서 가장 핵심**적인 정보로, 두 물체가 얼마나 떨어져 있는지 '에너지'로 계산할 수 있게 해주는 **잠재적인 중력장** 역할
+# [ARCH L0025] (MathGeometricPreprocessor._extract_raw_features (Scalar: HSI/Structure/SDF)) 
+# [ARCH L0026] (MathGeometricPreprocessor._extract_raw_features (Scalar: HSI/Structure/SDF)) 
+# [ARCH L0027] (MathGeometricPreprocessor._extract_raw_features (Scalar: HSI/Structure/SDF))     **하이퍼파라미터:**
+# [ARCH L0028] (MathGeometricPreprocessor._extract_raw_features (Scalar: HSI/Structure/SDF))     - `SDF_SKELETON_POWER = 8.0`: 뼈대 선명도 (높을수록 얇아짐)
+# [ARCH L0029] (MathGeometricPreprocessor._extract_raw_features (Scalar: HSI/Structure/SDF))     - `SDF_FIELD_POWER = 2.0`: 장 부드러움 (낮을수록 넓게 퍼짐)
+# [ARCH L0030] (MathGeometricPreprocessor._extract_raw_features (Scalar: HSI/Structure/SDF))     - `SDF_FIELD_WEIGHT = 0.4`: 장 가중치 (뼈대 대비 영향력)
+# [ARCH L0031] (MathGeometricPreprocessor._extract_raw_features (Scalar: HSI/Structure/SDF)) 
+# [ARCH L0032] (MathGeometricPreprocessor._extract_raw_features (Scalar: HSI/Structure/SDF))     **물리적 의미:**
+# [ARCH L0033] (MathGeometricPreprocessor._extract_raw_features (Scalar: HSI/Structure/SDF))     - **Skeleton Component**: 정확한 엣지 위치 표현 (위치 정밀도)
+# [ARCH L0034] (MathGeometricPreprocessor._extract_raw_features (Scalar: HSI/Structure/SDF))     - **Field Component**: 넓은 탐색 범위 제공 (수렴 Basin 확대)
+# [ARCH L0035] (MathGeometricPreprocessor._extract_raw_features (Scalar: HSI/Structure/SDF))     - **Max Fusion**: 두 장점을 모두 활용 (날카로움 + 부드러움)
+# [ARCH L0036] (MathGeometricPreprocessor._extract_raw_features (Scalar: HSI/Structure/SDF)) 
+# [ARCH L0037] (MathGeometricPreprocessor.get_flow_features (Vector field)) ### **2. V (Vector): 변화의 방향과 흐름**
+# [ARCH L0038] (MathGeometricPreprocessor.get_flow_features (Vector field)) 
+# [ARCH L0039] (MathGeometricPreprocessor.get_flow_features (Vector field)) 벡터는 이미지 내에서 **"어느 쪽으로 움직이는가"**라는 동적인 정보를 담습니다.
+# [ARCH L0040] (MathGeometricPreprocessor.get_flow_features (Vector field)) 
+# [ARCH L0041] (MathGeometricPreprocessor.get_flow_features (Vector field)) - **Gradient (경계 변화)**
+# [ARCH L0042] (MathGeometricPreprocessor.get_flow_features (Vector field))     - 픽셀 값이 가장 급격하게 변하는 방향($dx, dy$)
+# [ARCH L0043] (MathGeometricPreprocessor.get_flow_features (Vector field))     - 물체의 **윤곽선에 수직인 방향**을 가리키며, 두 이미지가 정렬될 때 "선의 방향이 일치하는지" 확인하는 기준이 됨
+# [ARCH L0044] (MathGeometricPreprocessor.get_flow_features (Vector field)) - **Texture Flow (텍스처 흐름)**
+# [ARCH L0045] (MathGeometricPreprocessor.get_flow_features (Vector field))     - 질감(결)이 반복되거나 흐르는 방향($fx, fy$)
+# [ARCH L0046] (MathGeometricPreprocessor.get_flow_features (Vector field))     - 엣지가 없는 매끄러운 표면에서도 **"결의 방향"**을 알 수 있게 하여, 특징이 부족한 영역에서도 매칭의 단서를 제공
+# [ARCH L0047] (MathGeometricPreprocessor.get_flow_features (Vector field)) 
+# [ARCH L0048] (MathGeometricPreprocessor.get_flow_features (Bivector candidate wedge)) ### **3. B (Bivector 후보): 회전의 잠재력**
+# [ARCH L0049] (MathGeometricPreprocessor.get_flow_features (Bivector candidate wedge)) 
+# [ARCH L0050] (MathGeometricPreprocessor.get_flow_features (Bivector candidate wedge)) - **Bivector Candidate:** 벡터와 벡터 사이의 외적(Wedge Product)을 통해 생성될 **회전 성분의 씨앗**
+# [ARCH L0051] (MathGeometricPreprocessor.get_flow_features (Bivector candidate wedge)) - **의미:** 단순히 점이 이동하는 것을 넘어, "이 구역은 시계 방향으로 돌아가 있는가?"를 판단하기 위한 재료. 나중에 Phase 2에서 **Rotor(회전 연산자)**를 만드는 결정적인 근거가 됩니다.
+# [ARCH L0052] (MathGeometricPreprocessor.get_flow_features (Bivector candidate wedge)) 
+# [ARCH L0053] (MathGeometricPreprocessor.get_flow_features (Bivector candidate wedge)) ---
+# [ARCH L0054] (MathGeometricPreprocessor.get_flow_features (Bivector candidate wedge)) 
+# =============================================================================
 """
 ================================================================================
 Phase 1: Geometry Raw Data 추출 (Physical Raw Data Extraction)
@@ -10,6 +70,7 @@ Phase 1: Geometry Raw Data 추출 (Physical Raw Data Extraction)
 출력 구성:
 - S (Scalar): Texture, Structure Energy, Edge Magnitude, SDF
 - V (Vector): Gradient Vector (dx, dy), Texture Flow Vector (fx, fy)
+- B (Bivector 후보): Wedge Product 기반 회전 잠재력 (bivector_candidate)
 - Global Context: 이미지 전체의 통계 요약 (v_shape)
 
 피라미드 스케일 의미:
@@ -93,6 +154,7 @@ class MathGeometricPreprocessor:
             - structure_energy (Scalar): 결의 선명도 [Architecture.md §1.1 - Structure Energy]
             - v1_x, v1_y (Vector 1): Gradient Vector [Architecture.md §1.2 - Gradient]
             - v2_x, v2_y (Vector 2): Texture Flow Vector [Architecture.md §1.2 - Texture Flow]
+            - bivector_candidate (Bivector 후보): v1 ∧ v2 (Wedge Product) [Architecture.md §1.3 - B]
         """
         img_float = gray_img.astype(np.float32) / 255.0
 
@@ -143,7 +205,18 @@ class MathGeometricPreprocessor:
         v2_x = v2_x * structure_energy
         v2_y = v2_y * structure_energy
 
-        return edge_magnitude, structure_energy, v1_x, v1_y, v2_x, v2_y
+        # =========================================================
+        # [Part 5] Bivector Candidate (B): "회전의 잠재력 (Wedge Product)"
+        # Architecture.md §1.3 - B (Bivector 후보)
+        # =========================================================
+        # 2D wedge product: v1 ∧ v2 = v1_x * v2_y - v1_y * v2_x
+        # 의미: 단순 이동이 아닌, 지역적 회전(시계/반시계)의 씨앗
+        bivector_candidate = (v1_x * v2_y) - (v1_y * v2_x)
+        # [-1, 1]로 정규화 (부호=회전 방향, 크기=신뢰도)
+        b_max = np.max(np.abs(bivector_candidate)) + 1e-6
+        bivector_candidate = bivector_candidate / b_max
+
+        return edge_magnitude, structure_energy, v1_x, v1_y, v2_x, v2_y, bivector_candidate
 
     def get_edge_sdf(self, gray_img):
         """
@@ -201,7 +274,7 @@ class MathGeometricPreprocessor:
         texture = self.clahe.apply(gray).astype(np.float32) / 255.0
         
         # [§1.2 Vector] + [§1.1 Scalar: Edge Mag, Struct Energy]
-        edge_mag, struct_energy, dx, dy, fx, fy = self.get_flow_features(gray)
+        edge_mag, struct_energy, dx, dy, fx, fy, b_candidate = self.get_flow_features(gray)
         
         # [§1.1 Scalar] SDF 추출
         sdf_map = self.get_edge_sdf(gray)
@@ -227,6 +300,7 @@ class MathGeometricPreprocessor:
             'hsi': hsi_replacement,
             'sdf': sdf_map,
             'gradient': vector_field,
+            'bivector': b_candidate,  # [Architecture.md §1.3] Bivector 후보 (Wedge Product)
             'v_shape': v_shape
         }
     

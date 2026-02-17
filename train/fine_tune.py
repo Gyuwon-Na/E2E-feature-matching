@@ -33,12 +33,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Subset, RandomSampler
 from torch.optim.lr_scheduler import LambdaLR, CosineAnnealingLR, SequentialLR
 from tqdm import tqdm
 import time
 import json
 import math
+import shutil
 
 
 import os
@@ -96,6 +97,14 @@ LOG_INTERVAL = 20                # [Hyperparameter] 로깅 주기
 # [v5 신규] 데이터 증강 설정
 AUGMENTATION_PROB = 0.3          # [Hyperparameter] 추가 증강 확률
 SCALE_JITTER_RANGE = (0.95, 1.05)  # [Hyperparameter] 스케일 변동 범위
+
+# [v6 신규] Ring+Mix Curriculum Sampling (큰 각도 수렴 안정화)
+# - Stage 내에서 이미 학습된 core(=stage start angle) 범위는 유지하고,
+#   새로 확장되는 ring 구간(stage start ~ current max)에 더 많은 확률을 할당합니다.
+RING_MIX_ENABLED = True
+RING_PROB_MAX = 0.7          # stage 후반에 ring 샘플링 최대 확률
+RING_PROGRESS_POWER = 1.0    # 1.0=선형, >1.0이면 후반에 더 몰아줌
+RING_MIN_WIDTH_DEG = 2.0     # ring 폭이 너무 얇으면 ring 샘플링 비활성화
 
 
 # =============================================================================
@@ -320,16 +329,44 @@ class GeometricRotationDataset(Dataset):
     
     def set_epoch(self, epoch):
         """
-        [v5] 에폭 업데이트 및 커리큘럼 적용
-        
+        [v6] 에폭 업데이트 및 커리큘럼 적용 (+ Ring+Mix용 stage 메타 저장)
+
         Args:
             epoch: 현재 에폭 (0-indexed)
         """
         self.current_epoch = epoch
-        
+
+        # 기본값 (커리큘럼이 없거나 stage 탐색 실패 시 안전장치)
+        self.stage_idx = 0
+        self.stage_start_ep = 0
+        self.stage_end_ep = max(epoch + 1, 1)
+        self.stage_start_ang = float(abs(self.rot_min))
+        self.stage_end_ang = float(abs(self.rot_max))
+
         if self.curriculum:
+            # 회전 범위 업데이트
             self.rot_min, self.rot_max = self.curriculum.get_rotation_range(epoch)
-    
+
+            # CurriculumScheduler.stages: (start_ep, end_ep, start_ang, end_ang)
+            for s_idx, (s_ep, e_ep, s_ang, e_ang) in enumerate(self.curriculum.stages):
+                if s_ep <= epoch < e_ep:
+                    self.stage_idx = s_idx
+                    self.stage_start_ep = int(s_ep)
+                    self.stage_end_ep = int(e_ep)
+                    self.stage_start_ang = float(s_ang)
+                    self.stage_end_ang = float(e_ang)
+                    break
+            else:
+                # 마지막 스테이지 이후: 마지막 stage 메타 사용
+                if getattr(self.curriculum, 'stages', None):
+                    s_idx = len(self.curriculum.stages) - 1
+                    s_ep, e_ep, s_ang, e_ang = self.curriculum.stages[s_idx]
+                    self.stage_idx = s_idx
+                    self.stage_start_ep = int(s_ep)
+                    self.stage_end_ep = int(e_ep)
+                    self.stage_start_ang = float(s_ang)
+                    self.stage_end_ang = float(e_ang)
+
     def _get_preprocessor(self):
         """지연 로딩으로 메모리 효율화"""
         if self.preprocessor is None:
@@ -349,6 +386,47 @@ class GeometricRotationDataset(Dataset):
         M_pix_aug = np.vstack([matrix_pixel, [0, 0, 1]])
         M_norm_aug = N @ M_pix_aug @ N_inv
         return M_norm_aug[:2, :]
+
+    def _sample_rotation_angle(self) -> float:
+        """
+        [v6] Ring+Mix 커리큘럼 기반 회전 각도 샘플링 (degree)
+
+        - core: [-core_max, core_max] (이미 학습된 범위 유지)
+        - ring:  sign * U(core_max, current_max) (새로 확장되는 구간 집중)
+
+        Note:
+            - is_train=False(검증/테스트)에서는 기존처럼 uniform 샘플링(=분포 안정)만 사용합니다.
+        """
+        # 검증/테스트는 항상 uniform(분포 고정) + jitter OFF
+        if (not self.is_train) or (not RING_MIX_ENABLED) or (self.curriculum is None):
+            return float(np.random.uniform(self.rot_min, self.rot_max))
+
+        current_max = float(abs(self.rot_max))
+        if current_max <= 0.0:
+            return 0.0
+
+        # stage start angle을 core로 사용 (stage 내에서 확장되는 구간을 ring으로 정의)
+        core_max = float(min(current_max, abs(getattr(self, 'stage_start_ang', current_max))))
+        ring_width = current_max - core_max
+
+        # ring 폭이 너무 얇으면(초반) 그냥 uniform
+        if ring_width < float(RING_MIN_WIDTH_DEG):
+            return float(np.random.uniform(-current_max, current_max))
+
+        # stage 진행률 기반으로 ring 확률 스케줄링
+        denom = max(int(getattr(self, 'stage_end_ep', self.current_epoch + 1)) - int(getattr(self, 'stage_start_ep', self.current_epoch)), 1)
+        progress = float((int(self.current_epoch) - int(getattr(self, 'stage_start_ep', self.current_epoch))) / denom)
+        progress = max(0.0, min(1.0, progress))
+
+        p_ring = float(min(RING_PROB_MAX, RING_PROB_MAX * (progress ** float(RING_PROGRESS_POWER))))
+
+        if np.random.random() < p_ring:
+            abs_angle = float(np.random.uniform(core_max, current_max))
+            sign = -1.0 if np.random.random() < 0.5 else 1.0
+            return sign * abs_angle
+
+        # core 샘플
+        return float(np.random.uniform(-core_max, core_max))
     
     def __getitem__(self, idx):
         """
@@ -367,8 +445,8 @@ class GeometricRotationDataset(Dataset):
         img_rgb = cv2.resize(img_rgb, IMG_SIZE)
         rows, cols = img_rgb.shape[:2]
         
-        # [v5] 회전 각도 샘플링 (커리큘럼 범위 내)
-        angle = np.random.uniform(self.rot_min, self.rot_max)
+        # [v6] 회전 각도 샘플링 (Ring+Mix / uniform fallback)
+        angle = self._sample_rotation_angle()
         
         # [v5] 스케일 변동 추가 (학습 모드에서만)
         if self.is_train and np.random.random() < AUGMENTATION_PROB:
@@ -463,8 +541,9 @@ class MetricTracker:
     def update(self, pred_W, gt_W, pred_angle, gt_angle, loss):
         """지표 업데이트"""
         with torch.no_grad():
-            # 각도 오차 (degree)
-            angle_diff = torch.abs(pred_angle - gt_angle) * 180 / np.pi
+            # 각도 오차 (degree) - wrap to [-π, π]
+            delta = torch.atan2(torch.sin(pred_angle - gt_angle), torch.cos(pred_angle - gt_angle))
+            angle_diff = torch.abs(delta) * 180 / np.pi
             self.angle_errors.extend(angle_diff.cpu().numpy().tolist())
             
             # 픽셀 오차 (네 모서리 기준)
@@ -658,16 +737,18 @@ def validate(embedder, transformer, dataloader, criterion, device_info):
 # [Main Training Function]
 # =============================================================================
 
-def train(img_dir, resume_from=None, debug_mode=False):
+def train(img_dir, resume_from=None, debug_mode=False, max_samples=None, epoch_samples=0):
     """
-    [Main] v5 학습 메인 함수
+    [Main] v6 학습 메인 함수 (Ring+Mix + Val jitter OFF + epoch sampling)
     
-    RTX 3090 24GB에 최적화된 ±60° 커리큘럼 학습
+    RTX 3090 24GB에 최적화된 커리큘럼 학습 (Ring+Mix Sampling + Metric Wrap)
     
     Args:
         img_dir: 이미지 디렉토리 경로
         resume_from: 재개할 체크포인트 경로
         debug_mode: 디버그 모드 (적은 샘플로 테스트)
+        max_samples: 로드할 최대 이미지 수 (None이면 기본값 사용)
+        epoch_samples: (옵션) epoch마다 학습에 사용할 샘플 수 (0이면 전체 사용)
     """
     
     # -------------------------------------------------------------------------
@@ -682,15 +763,15 @@ def train(img_dir, resume_from=None, debug_mode=False):
         run_epochs = 30  # 디버그용 짧은 에폭
         save_name_prefix = "debug_"
     else:
-        limit_samples = MAX_SAMPLES_NUM
+        limit_samples = max_samples if (max_samples is not None) else MAX_SAMPLES_NUM
         run_epochs = NUM_EPOCHS
-        save_name_prefix = "v5_60deg_"
+        save_name_prefix = "v6_ringmix_"
     
     # -------------------------------------------------------------------------
     # [Print Configuration]
     # -------------------------------------------------------------------------
     print("=" * 70)
-    print("🚀 Geometric Matching Model Training (v5 - RTX 3090 Optimized)")
+    print("🚀 Geometric Matching Model Training (v6 - Ring+Mix + Val jitter OFF)")
     print("=" * 70)
     print(f"   Target Rotation: ±{ROTATION_MAX}° (3-Stage Curriculum)")
     print(f"   Stages:")
@@ -722,35 +803,69 @@ def train(img_dir, resume_from=None, debug_mode=False):
     # ==========================================================================
     print("\n📊 Loading Dataset...")
     
-    full_dataset = GeometricRotationDataset(
+    # [v6] train/val dataset 분리:
+    #   - train: is_train=True  (scale jitter ON)
+    #   - val:   is_train=False (scale jitter OFF)
+    train_base = GeometricRotationDataset(
         img_dir, is_train=True, max_samples=limit_samples,
         rot_min=ROTATION_MIN, rot_max=ROTATION_MAX,
         curriculum_scheduler=curriculum
     )
-    
-    total_size = len(full_dataset)
+
+    val_base = GeometricRotationDataset(
+        img_dir, is_train=False, max_samples=limit_samples,
+        rot_min=ROTATION_MIN, rot_max=ROTATION_MAX,
+        curriculum_scheduler=curriculum
+    )
+
+    # 안전장치: train/val이 동일한 path ordering을 사용하도록 동기화
+    val_base.img_paths = list(train_base.img_paths)
+
+    total_size = len(train_base)
     val_size = max(int(total_size * VAL_SPLIT), 1)
     train_size = total_size - val_size
-    
-    train_dataset, val_dataset = torch.utils.data.random_split(
-        full_dataset, [train_size, val_size],
-        generator=torch.Generator().manual_seed(42)
-    )
-    
+
+    # 고정 시드 split
+    perm = torch.randperm(total_size, generator=torch.Generator().manual_seed(42)).tolist()
+    train_indices = perm[:train_size]
+    val_indices = perm[train_size:]
+
+    train_dataset = Subset(train_base, train_indices)
+    val_dataset = Subset(val_base, val_indices)
+
     # [v5] num_workers 증가 (RTX 3090에서 CPU 병목 방지)
     num_workers = min(4, os.cpu_count() or 1)
-    
-    train_loader = DataLoader(
-        train_dataset, batch_size=BATCH_SIZE, shuffle=True,
-        collate_fn=collate_fn_geometric, num_workers=num_workers, 
-        drop_last=True, pin_memory=True
-    )
+
+    # --------------------------------------------------------------
+    # [v6 옵션] epoch 샘플링: 5000장을 로드하되 epoch마다 N장만 뽑아 학습
+    # --------------------------------------------------------------
+    train_sampler = None
+    if epoch_samples is not None and int(epoch_samples) > 0:
+        n = min(int(epoch_samples), len(train_dataset))
+        train_sampler = RandomSampler(train_dataset, replacement=False, num_samples=n)
+        print(f"   🧩 Epoch Sampling: {n} samples/epoch (from {len(train_dataset)} train samples)")
+    else:
+        print("   🧩 Epoch Sampling: OFF (use full train set)")
+
+    if train_sampler is None:
+        train_loader = DataLoader(
+            train_dataset, batch_size=BATCH_SIZE, shuffle=True,
+            collate_fn=collate_fn_geometric, num_workers=num_workers,
+            drop_last=True, pin_memory=True
+        )
+    else:
+        train_loader = DataLoader(
+            train_dataset, batch_size=BATCH_SIZE, shuffle=False, sampler=train_sampler,
+            collate_fn=collate_fn_geometric, num_workers=num_workers,
+            drop_last=True, pin_memory=True
+        )
+
     val_loader = DataLoader(
         val_dataset, batch_size=BATCH_SIZE, shuffle=False,
         collate_fn=collate_fn_geometric, num_workers=num_workers,
         pin_memory=True
     )
-    
+
     print(f"   Train: {train_size}, Val: {val_size}")
     print(f"   Workers: {num_workers}")
     
@@ -808,6 +923,7 @@ def train(img_dir, resume_from=None, debug_mode=False):
     start_epoch = 0
     best_val_loss = float('inf')
     patience_counter = 0
+    best_ckpt_path = None  # [v6] stage별 best pth 경로 추적 (파일명에 rot/angle 반영)
     
     if resume_from and os.path.exists(resume_from):
         print(f"\n📥 Resuming from: {resume_from}")
@@ -839,7 +955,8 @@ def train(img_dir, resume_from=None, debug_mode=False):
         epoch_start = time.time()
         
         # 커리큘럼 업데이트
-        full_dataset.set_epoch(epoch)
+        train_base.set_epoch(epoch)
+        val_base.set_epoch(epoch)
         stage_info = curriculum.get_stage_info(epoch)
         current_rot = stage_info['rotation_range']
 
@@ -850,6 +967,7 @@ def train(img_dir, resume_from=None, debug_mode=False):
                 # 🔥 스테이지 전환 시 patience & best_val_loss 리셋
                 patience_counter = 0
                 best_val_loss = float('inf')
+                best_ckpt_path = None  # [v6] 새 stage 시작: 이전 stage best 파일은 보존
                 print(f"   🔄 Stage {current_stage} 시작! patience & best_loss 리셋")
         
         # 현재 LR
@@ -893,7 +1011,25 @@ def train(img_dir, resume_from=None, debug_mode=False):
             # =================================================================
             if current_val_loss < best_val_loss:
                 best_val_loss = current_val_loss
-                torch.save({
+
+                # -------------------------------------------------------------
+                # [v6 요청사항] Best checkpoint 파일명:
+                #   rot{현재테스트각도}_{angle error +- std}.pth
+                # -------------------------------------------------------------
+                current_test_angle = int(round(abs(current_rot[1])))
+                angle_mean = float(val_metrics.get('angle_error_mean', 0.0))
+                angle_std = float(val_metrics.get('angle_error_std', 0.0))
+                best_fname = f"rot{current_test_angle}_{angle_mean:.2f}+-{angle_std:.2f}.pth"
+                best_path = os.path.join(CHECKPOINT_DIR, best_fname)
+
+                # 같은 stage 내에서는 이전 best 파일 1개만 유지(파일 폭증 방지)
+                if best_ckpt_path and os.path.exists(best_ckpt_path) and (best_ckpt_path != best_path):
+                    try:
+                        os.remove(best_ckpt_path)
+                    except Exception as e:
+                        print(f"   ⚠️ Failed to remove previous best checkpoint: {e}")
+
+                ckpt = {
                     'epoch': epoch,
                     'embedder': embedder.state_dict(),
                     'transformer': transformer.state_dict(),
@@ -901,11 +1037,25 @@ def train(img_dir, resume_from=None, debug_mode=False):
                     'best_val_loss': best_val_loss,
                     'metrics': val_metrics,
                     'training_config': {
-                        'version': 'v5_best',
-                        'rotation_range': current_rot
+                        'version': 'v6_ringmix_best',
+                        'rotation_range': current_rot,
+                        'current_test_angle': current_test_angle,
+                        'epoch_samples': int(epoch_samples) if epoch_samples is not None else 0,
+                        'max_samples': int(limit_samples) if limit_samples is not None else None,
                     }
-                }, os.path.join(CHECKPOINT_DIR, f'{save_name_prefix}best_model.pth'))
-                print(f"   🌟 Best Model Saved! (Loss: {best_val_loss:.4f})")
+                }
+
+                torch.save(ckpt, best_path)
+                best_ckpt_path = best_path
+
+                # (호환) 기존 방식의 고정 파일명도 업데이트 (resume 편의)
+                stable_best_path = os.path.join(CHECKPOINT_DIR, f"{save_name_prefix}best_model.pth")
+                try:
+                    shutil.copyfile(best_path, stable_best_path)
+                except Exception as e:
+                    print(f"   ⚠️ Failed to update stable best model copy: {e}")
+
+                print(f"   🌟 Best Model Saved! -> {best_fname} (Loss: {best_val_loss:.4f})")
 
             # history 업데이트 (current_val_loss 변수 사용)
             history['val_loss'].append(current_val_loss)
@@ -936,7 +1086,7 @@ def train(img_dir, resume_from=None, debug_mode=False):
     print("🎉 Training Complete!")
     print("=" * 70)
     
-    best_model_path = os.path.join(CHECKPOINT_DIR, f'{save_name_prefix}best_model.pth')
+    best_model_path = best_ckpt_path if (best_ckpt_path is not None) else os.path.join(CHECKPOINT_DIR, f'{save_name_prefix}best_model.pth')
     if os.path.exists(best_model_path):
         best_ckpt = torch.load(best_model_path, weights_only=False)
         final_metrics = best_ckpt.get('metrics', {})
@@ -946,7 +1096,7 @@ def train(img_dir, resume_from=None, debug_mode=False):
         print(f"   Val Loss: {best_val_loss:.4f}")
         print(f"   Angle Error: {final_metrics.get('angle_error_mean', 'N/A'):.2f}°")
         print(f"   Pixel Error: {final_metrics.get('pixel_error_mean', 'N/A'):.2f}px")
-        print(f"   Trained up to: ±{final_config.get('current_rotation', ['?', '?'])[1]}°")
+        print(f"   Trained up to: ±{final_config.get('current_test_angle', '?')}°")
     
     # History 저장
     with open(os.path.join(CHECKPOINT_DIR, f'{save_name_prefix}history.json'), 'w') as f:
@@ -1001,7 +1151,7 @@ def quick_test(img_dir, checkpoint_path=None, test_angles=[15, 30, 45, 60]):
         print(f"\n   Testing ±{test_angle}°...")
         
         test_dataset = GeometricRotationDataset(
-            img_dir, max_samples=20,
+            img_dir, is_train=False, max_samples=20,
             rot_min=-test_angle, rot_max=test_angle
         )
         test_loader = DataLoader(test_dataset, batch_size=1, collate_fn=collate_fn_geometric)
@@ -1017,13 +1167,15 @@ def quick_test(img_dir, checkpoint_path=None, test_angles=[15, 30, 45, 60]):
                 phase2_b = embedder(pyramid_b, device)
                 results_model = transformer(phase2_a, phase2_b)
                 
-                rotor = results_model[0]['rotor_map']
-                avg_rotor = rotor.mean(dim=(1, 2))
-                
-                pred_angle = np.degrees(np.arctan2(avg_rotor[0, 1].item(), avg_rotor[0, 0].item()))
-                gt_angle_deg = np.degrees(gt_angle_rad)
-                
-                error = abs(pred_angle - gt_angle_deg)
+                # Phase3 outputs → pred_W(A→B) + unit rotor(cos/sin)
+                pred_W, cos_t, sin_t, _ = extract_pred_transform_from_phase3(results_model)
+                pred_angle_rad = torch.atan2(sin_t, cos_t).item()
+                pred_angle_deg = float(np.degrees(pred_angle_rad))
+                gt_angle_deg = float(np.degrees(gt_angle_rad))
+
+                # [v6] wrap error to [-180, 180] (degree)
+                delta = ((pred_angle_deg - gt_angle_deg + 180.0) % 360.0) - 180.0
+                error = abs(delta)
                 errors.append(error)
         
         mean_err = np.mean(errors)
@@ -1044,13 +1196,17 @@ def quick_test(img_dir, checkpoint_path=None, test_angles=[15, 30, 45, 60]):
 if __name__ == "__main__":
     import argparse
     
-    parser = argparse.ArgumentParser(description='Geometric Matching Training v5 (RTX 3090 Optimized)')
+    parser = argparse.ArgumentParser(description='Geometric Matching Training v6 (Ring+Mix + Val jitter OFF)')
     parser.add_argument('--img_dir', type=str, default='./val2017',
                         help='Image directory path')
     parser.add_argument('--resume', type=str, default=None,
                         help='Resume from checkpoint')
     parser.add_argument('--debug', action='store_true',
                         help='Debug mode with limited samples')
+    parser.add_argument('--max_samples', type=int, default=None,
+                        help='Max number of images to load (override default)')
+    parser.add_argument('--epoch_samples', type=int, default=0,
+                        help='(Option) Number of training samples per epoch (0=use all)')
     parser.add_argument('--test', action='store_true',
                         help='Run quick test')
     parser.add_argument('--checkpoint', type=str, default=None,
@@ -1061,4 +1217,4 @@ if __name__ == "__main__":
     if args.test:
         quick_test(args.img_dir, args.checkpoint)
     else:
-        train(args.img_dir, args.resume, args.debug)
+        train(args.img_dir, args.resume, args.debug, max_samples=args.max_samples, epoch_samples=args.epoch_samples)

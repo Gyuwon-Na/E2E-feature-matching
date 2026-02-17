@@ -234,7 +234,7 @@ Phase 1에서 준비된 해상도별 물리량(S, V, B 후보)을 입력받아, 
         1. 해당 Feature Map은 에너지 포텐셜 (Scalar Field)와 벡터 필드를 포함하는 다채널 구조로 출력
 
 ---
-## **📂 Phase 3.5: Dual-Adaptive Recurrent Refinement**
+## **📂 Phase 4: Dual-Adaptive Recurrent Refinement**
 
 Phase 3의 단일 추정(Single-Shot)으로는 큰 변환(>15°, >20px)에서 정확도가 떨어지는 문제를 해결하기 위해,
 **이중 적응형(Dual-Adaptive) 전략**과 **경량 순환 신경망(Mini-GRU)**을 결합한 능동적 정제 단계입니다.
@@ -381,7 +381,7 @@ if h_prev.shape[-2:] != target_size:
    $$
    E_{curr} < \epsilon_{\text{target}}
    $$
-   - **[Hyperparameter]** $\epsilon_{\text{target}} = 3.0$ px (Phase 4가 해결 가능한 범위)
+   - **[Hyperparameter]** $\epsilon_{\text{target}} = 3.0$ px (Phase 5가 해결 가능한 범위)
 
 #### **B. 발산 방지 (Bounded Safety Lock)**
 
@@ -420,7 +420,7 @@ $$
 **효과:**
 - Local Minima(작은 언덕)에 갇혔을 때 **GRU Reset**으로 탈출 가능
 - 학습률을 낮춰 **과도한 변화(Overshoot)**를 방지
-- Phase 4의 강력한 수렴 능력(Basin ≈ 10px)을 신뢰하므로, 약간의 악화는 허용
+- Phase 5의 강력한 수렴 능력(Basin ≈ 10px)을 신뢰하므로, 약간의 악화는 허용
 
 ---
 
@@ -431,16 +431,16 @@ $$
 | `num_iterations` | **4** | 2~6 | 최대 반복 횟수 |
 | `gru_hidden_dim` | **16** | 8~32 | GRU Hidden State 차원 |
 | `convergence_threshold` | **0.005** | 0.001~0.01 | 수렴 판정 임계값 |
-| `target_error_px` | **3.0** | 1.0~5.0 | 목표 오차 (Phase 4 이관 기준) |
+| `target_error_px` | **3.0** | 1.0~5.0 | 목표 오차 (Phase 5 이관 기준) |
 | `tolerance_alpha` | **0.05** | 0.03~0.1 | 발산 방지 허용 오차 (5%) |
 | `level_thresholds` | **[30, 10, 5]** | - | Level 전환 임계값 (px) |
 | `feature_thresholds` | **[10.0, 0.1]** | - | S/V/B 선택 임계값 |
 
 
 ---
-## **📂  4: 기하학적 에너지 기반 MPC 정제 — 추론 단계에서만**
+## **📂 Phase 5: 기하학적 에너지 기반 MPC 정제 — 추론 단계에서만**
 
-Phase 4는 딥러닝이 예측한 매칭 지도를 바탕으로 물리적인 에너지 함수를 최소화하여 **0.1 픽셀 단위의 초정밀 정렬**을 달성하는 단계입니다.
+Phase 5는 딥러닝이 예측한 매칭 지도를 바탕으로 물리적인 에너지 함수를 최소화하여 **0.1 픽셀 단위의 초정밀 정렬**을 달성하는 단계입니다.
 
 ### **1. 전역 필터링 및 초기화**
 
@@ -548,3 +548,93 @@ $$L_{total} = \alpha \sum_{p \in \Omega} \underbrace{\left( L_{s}(p) + L_{v\_loc
     $$  L_{multi\_scale} = \sum_{l=0}^{L-1} \| W^{(l)} - \text{Upsample}(W^{(l+1)}) \|^2$$
     
     - **의미:** "작은 이미지에서 30도 돌렸으면, 큰 이미지에서도 30도 돌아가야 한다"는 물리적 일관성을 보장합니다. 이는 Coarse-to-Fine 전략의 허리 역할을 합니다.
+
+---
+
+## 📌 6: Code Implementation Notes (v5 / Code-Architecture Sync)
+
+> 이 섹션은 **architecture.md(개념 설계)** 와 **현재 코드 구현(phase1~phase4_2, losses, fine_tune/fast_finetune)** 사이의 차이를 없애기 위해,  
+> 코드에 존재하지만 본문에 상세히 없던 구현 포인트/하이퍼파라미터를 문서화한 **"Implementation Addendum"** 입니다.
+
+### 6.1 공통 하이퍼파라미터 (코드 기본값)
+
+- `HIDDEN_DIM = 48`  *(Phase 2 Clifford Embedding 기본 채널 수)*
+- `FEATURE_DIM = 144 (= 3 × 48)` *(Phase 3 Transformer 내부 S/V/B concat 특징 차원)*
+- `NUM_ENCODER_LAYERS = 3`, `NUM_ATTENTION_HEADS = 4`
+- `pyramid levels = 5` *(fine_tune.py 기본 학습 설정: 큰 회전(±60°) 대응을 위해 4→5로 확장)*
+
+### 6.2 Phase 2 구현 메모
+
+- **Rotor 생성 입력 채널 확장 (5채널):**  
+  `(dx, dy, fx, fy)`(Phase1의 V1/V2) 에 더해, Phase1에서 계산한 **Bivector 후보 `bivector = v1 ∧ v2`** 를 추가하여  
+  `rotor_in = concat([v_in(4ch), b_in(1ch)])` 형태로 Rotor Conv에 투입합니다.
+- **Scalar 업데이트 방식(s_mixer):**  
+  Cos 파트를 scalar embedding에 단순 가산하기보다, `concat([s_emb, cos_part]) → 1×1 Conv(s_mixer)` 로 **혼합**하여  
+  과도한 덮어쓰기(override)와 스케일 폭주를 줄입니다.
+
+### 6.3 Phase 3 구현 메모 (v5 메모리/속도 최적화 포함)
+
+- **Chunked Attention (RTX 3090 24GB 대응):**  
+  `SAFE_N_LIMIT`, `SAFE_ELEMENTS` 기준으로 픽셀 수(N)가 큰 레벨에서 attention을 chunk 단위로 수행합니다.
+- **Optional High-Res Attention Skip:**  
+  `HIGH_RES_SKIP_LEVEL` 을 통해 level 0~1(고해상도)에서 self/cross-attention을 생략하고  
+  **이전 레벨 rotor/context를 업샘플링**하여 속도/메모리를 확보할 수 있습니다.
+- **Transform-Guided Warping + Residual Composition:**  
+  coarse 레벨에서 얻은 `W_prev`로 A 특징을 먼저 warp한 뒤, 다음 레벨에서 잔차 `ΔW`만 추정하여  
+  `W_current = ΔW ∘ W_prev` 로 누적합니다.
+- **Skip-Connection 실제 적용 강화:**  
+  rotor_map 기반 warp → gated injection → refinement block(ResBlock)을 **실제 forward path에 반영**합니다.
+- **Phase 5 사용을 위한 Gate Map 노출:**  
+  Phase3 내부에서 계산 가능한 `g_s, g_v, g_b` gate map을 **출력 dict에 포함**하여 Phase4 MPC 에너지 가중치로 사용 가능합니다.
+
+### 6.4 Phase 4.2 구현 메모
+
+- **Similarity Transform 파라미터화 최적화:**  
+  `(theta, tx, ty, log_scale)` 를 Adam으로 최적화한 뒤 2×3 affine로 재구성합니다.
+- **Valid Mask (검정 잘림 영역 Loss 제외):**  
+  warp 과정에서 in-bounds mask를 생성하고, out-of-bounds 픽셀은 energy 계산에서 제외합니다.
+- **Priority Map 자동 생성 옵션:**  
+  priority_map이 주어지지 않으면,  
+  - rotor_map의 **지역 회전 분산(variance)**  
+  - mpc_map의 **벡터장 크기(magnitude)**  
+  를 결합하여 priority 가중치를 만들 수 있습니다.
+
+### 6.5 Loss / Training 구현 메모
+
+- losses.py 의 `UnifiedGeometricLoss` 는 architecture.md §5의 큰 구조(Geo + Final + Iter)를 유지하면서,  
+  학습 안정성을 위해 아래 항목을 추가/보강합니다:
+  - `L_angle` (pred angle ↔ gt angle 직접 loss)
+  - `L_pixel` (scalar feature consistency)
+  - `L_rotation_invariant` (±60° 구간에서 회전 불변성/대칭성 강제)
+- `normalize_rotor_output()` 헬퍼로 cos/sin unit-normalization을 표준화합니다.
+
+---
+
+## 📌 7: Training & Fine-Tuning Pipeline (fine_tune.py / fast_finetune.py)
+
+### 7.1 Dataset: GeometricRotationDataset
+
+- 입력 이미지 B에 대해 랜덤 회전(커리큘럼 범위) + (옵션) 스케일 jitter 를 적용하여 A를 생성합니다.
+- GT는 `A → B` 로 되돌리는 **역변환 affine** 를 계산하여 `W_gt (normalized coord)` 로 제공합니다.
+- Phase1 전처리를 통해 `levels=5` 피라미드(raw scalar/vector/bivector 등)를 생성합니다.
+
+### 7.2 CurriculumScheduler (3-Stage)
+
+- `CURRICULUM_STAGES` 로 에폭 구간별 회전 범위를 점진적으로 확장(또는 이동)합니다.
+- Dataset은 `set_epoch(epoch)` 에서 현재 회전 범위를 갱신합니다.
+
+### 7.3 Dataloader / Collate
+
+- 피라미드 레벨별 dict 구조를 유지한 채 batch stacking을 수행합니다.
+- phase2 embedder는 (HWC)/(BHWC) 모두 처리할 수 있도록 to_tensor를 구현합니다.
+
+### 7.4 Training Loop 핵심
+
+- Mixed Precision(cuDNN/AMP) + Gradient Accumulation 으로 3090 24GB 환경에서 안정적으로 학습합니다.
+- Phase2 → Phase3 forward 결과에서 `W_pred` 를 구성하고, `UnifiedGeometricLoss` 로 supervised fine-tuning 합니다.
+- MetricTracker로 각도 오차/픽셀 오차(코너 기준)를 추적합니다.
+
+### 7.5 fast_finetune.py
+
+- 빠른 실험을 위해 fine_tune의 일부 상수(에폭, 샘플 수, 회전 범위 등)를 monkey patch하여 재사용합니다.
+- 핵심 학습 루프 로직은 fine_tune.py 와 동일한 손실/지표 구조를 유지합니다.

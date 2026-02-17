@@ -1,3 +1,60 @@
+# =============================================================================
+# [ARCHITECTURE MAPPING (Phase4 + Addendum 6.4)]
+# =============================================================================
+# [ARCH L0441] ## **📂  4: 기하학적 에너지 기반 MPC 정제 — 추론 단계에서만** -> GeometricMPCRefiner (class overview)
+# [ARCH L0442]  -> GeometricMPCRefiner (see optimize/compute_energy)
+# [ARCH L0443] Phase 4는 딥러닝이 예측한 매칭 지도를 바탕으로 물리적인 에너지 함수를 최소화하여 **0.1 픽셀 단위의 초정밀 정렬**을 달성하는 단계입니다. -> GeometricMPCRefiner (see optimize/compute_energy)
+# [ARCH L0444]  -> GeometricMPCRefiner (see optimize/compute_energy)
+# [ARCH L0445] ### **1. 전역 필터링 및 초기화** -> GeometricMPCRefiner (class overview)
+# [ARCH L0446]  -> GeometricMPCRefiner (see optimize/compute_energy)
+# [ARCH L0447] - **역할:** 최적화 연산이 엉뚱한 곳에서 시작하지 않도록 기준점을 잡아줌 -> GeometricMPCRefiner (see optimize/compute_energy)
+# [ARCH L0448] - **전역 필터링:** Phase 2의 평균 Rotor(Sin/Cos)를 비교해 이미지 전체가 대략 몇 도 돌아갔는지 파악하여 터무니없는 후보군을 제거 -> GeometricMPCRefiner (see optimize/compute_energy)
+# [ARCH L0449] - **$W_0$ 설정:** 평균 Rotor(회전)와 벡터 크기 비율(줌)을 결합하여 초기 변환 행렬 **$W_0$**를 생성 -> GeometricMPCRefiner (see optimize/compute_energy)
+# [ARCH L0450]     - "대략 30도 돌아갔고 1.2배 커졌다"는 사실을 알고 최적화를 시작하므로 수렴 속도가 비약적으로 빨라짐 -> GeometricMPCRefiner (see optimize/compute_energy)
+# [ARCH L0451]  -> GeometricMPCRefiner (see optimize/compute_energy)
+# [ARCH L0452] ### **2. 지역 탐색 (Priority Search)** -> GeometricMPCRefiner.compute_priority_map / build_priority_map_from_features
+# [ARCH L0453]  -> GeometricMPCRefiner (see optimize/compute_energy)
+# [ARCH L0454] - **역할:** "어디부터 정밀하게 맞출 것인가?"라는 **우선순위 지도**를 만듭니다. -> GeometricMPCRefiner (see optimize/compute_energy)
+# [ARCH L0455] - **방법:** Phase 3에서 배운 **Group Conv 특징**과 지역적 Rotor 분산(Variance)을 결합 -> GeometricMPCRefiner (see optimize/compute_energy)
+# [ARCH L0456]     - 회전 정보가 일관되고 기하학적 덩어리가 뚜렷한 구역(예: 건물의 모서리)에 높은 가중치를 주어, 신뢰도가 높은 지역부터 자석처럼 딱딱 들어맞게 유도합니다. -> GeometricMPCRefiner (see optimize/compute_energy)
+# [ARCH L0457]  -> GeometricMPCRefiner (see optimize/compute_energy)
+# [ARCH L0458] ### **3. 에너지 평면 생성** -> GeometricMPCRefiner (class overview)
+# [ARCH L0459]  -> GeometricMPCRefiner (see optimize/compute_energy)
+# [ARCH L0460] 이 시스템의 핵심인 **에너지 함수**입니다. S, V, B 세 가지 성분을 물리적으로 결합하여 오차를 계산 -> GeometricMPCRefiner (see optimize/compute_energy)
+# [ARCH L0461]  -> GeometricMPCRefiner (see optimize/compute_energy)
+# [ARCH L0462] $$ -> GeometricMPCRefiner (see optimize/compute_energy)
+# [ARCH L0463] E_{total} = \frac{1}{N} \sum_{p} \left( g_s(p) \cdot E_{scalar}(p) + g_v(p) \cdot E_{vector}(p) + g_b(p) \cdot E_{bivector}(p) \right) -> GeometricMPCRefiner (see optimize/compute_energy)
+# [ARCH L0464] $$ -> GeometricMPCRefiner (see optimize/compute_energy)
+# [ARCH L0465]  -> GeometricMPCRefiner (see optimize/compute_energy)
+# [ARCH L0466] - **$E_{scalar}$ (에너지/SDF):** Softplus로 정제된 SDF 값의 차이를 계산 (→ 미분값이 매끄러워 최적화 엔진이 '골짜기'를 타고 내려가기 좋음) -> GeometricMPCRefiner (see optimize/compute_energy)
+# [ARCH L0467] - **$E_{vector}$ (방향/흐름):** 변환(W) 후에도 벡터의 방향이 일치하는지 확인 (→ 이미지가 회전했다면 벡터도 그만큼 돌아가야 한다는 **방향 보존성**을 강제) -> GeometricMPCRefiner (see optimize/compute_energy)
+# [ARCH L0468] - **$E_{bivector}$ (Rotor 일관성):** 단순히 위치만 맞는 게 아니라, 해당 지점의 **지역적인 회전/줌 상태**가 전체 변환 행렬과 기하학적으로 일치하는지 봄 -> GeometricMPCRefiner (see optimize/compute_energy)
+# [ARCH L0469] - 회전하여 검정색으로 잘린 영역에 대해서는 Loss X -> GeometricMPCRefiner (see optimize/compute_energy)
+# [ARCH L0470]  -> GeometricMPCRefiner (see optimize/compute_energy)
+# [ARCH L0471] ### **4. 기하학적 게이트 가중 최적화 (Gate-Guided Refinement)** -> GeometricMPCRefiner (class overview)
+# [ARCH L0472]  -> GeometricMPCRefiner (see optimize/compute_energy)
+# [ARCH L0473] - **핵심:** Phase 3(인코딩 과정 중)의 **Geometric Descriptor Guidance**에서 나온 3개의 Gate 값($~~g_s, g_v, g_b~~$)을 최적화 가중치로 직접 사용 -> GeometricMPCRefiner (see optimize/compute_energy)
+# [ARCH L0474] - **지능적 최적화:** -> GeometricMPCRefiner (see optimize/compute_energy)
+# [ARCH L0475]     - 엣지가 선명한 곳은 $g_v$(Vector)를 높여 방향 정밀도를 높입니다. -> GeometricMPCRefiner (see optimize/compute_energy)
+# [ARCH L0476]     - 텍스처가 복잡한 곳은 $g_s$(Scalar)를 높여 픽셀 일치도를 높입니다. -> GeometricMPCRefiner (see optimize/compute_energy)
+# [ARCH L0477]         - 모델이 "이 구역은 벡터 정보가 믿을만해!"라고 판단한 정보를 MPC가 적극 수용하여 루프를 돌림으로써, 단순 계산보다 훨씬 견고한 정제가 가능 -> GeometricMPCRefiner (see optimize/compute_energy)
+# [ARCH L0478]  -> GeometricMPCRefiner (see optimize/compute_energy)
+# [ARCH L0479] --- -> GeometricMPCRefiner (see optimize/compute_energy)
+# [ARCH L0480]  -> GeometricMPCRefiner (see optimize/compute_energy)
+# [ARCH L0590] ### 6.4 Phase 4.2 구현 메모 -> GeometricMPCRefiner (class overview)
+# [ARCH L0591]  -> GeometricMPCRefiner (see optimize/compute_energy)
+# [ARCH L0592] - **Similarity Transform 파라미터화 최적화:**   -> GeometricMPCRefiner (see optimize/compute_energy)
+# [ARCH L0593]   `(theta, tx, ty, log_scale)` 를 Adam으로 최적화한 뒤 2×3 affine로 재구성합니다. -> GeometricMPCRefiner.optimize
+# [ARCH L0594] - **Valid Mask (검정 잘림 영역 Loss 제외):**   -> GeometricMPCRefiner.compute_energy (valid_mask)
+# [ARCH L0595]   warp 과정에서 in-bounds mask를 생성하고, out-of-bounds 픽셀은 energy 계산에서 제외합니다. -> GeometricMPCRefiner.compute_energy (valid_mask)
+# [ARCH L0596] - **Priority Map 자동 생성 옵션:**   -> GeometricMPCRefiner.compute_priority_map / build_priority_map_from_features
+# [ARCH L0597]   priority_map이 주어지지 않으면,   -> GeometricMPCRefiner.compute_priority_map / build_priority_map_from_features
+# [ARCH L0598]   - rotor_map의 **지역 회전 분산(variance)**   -> GeometricMPCRefiner (see optimize/compute_energy)
+# [ARCH L0599]   - mpc_map의 **벡터장 크기(magnitude)**   -> GeometricMPCRefiner (see optimize/compute_energy)
+# [ARCH L0600]   를 결합하여 priority 가중치를 만들 수 있습니다. -> GeometricMPCRefiner.compute_priority_map / build_priority_map_from_features
+# [ARCH L0601]  -> GeometricMPCRefiner (see optimize/compute_energy)
+# =============================================================================
+
 """
 ================================================================================
 Phase 4_2 Improved: Robust Geometric MPC Refiner (Fixed)
@@ -174,6 +231,61 @@ class GeometricMPCRefiner(nn.Module):
         
         return normalized
     
+
+    # -------------------------------------------------------------------------
+    # [Architecture.md §4.2] Priority Map 자동 계산 (코드 보강)
+    # -------------------------------------------------------------------------
+    def compute_rotor_variance_map(self, rotor_field: torch.Tensor, window: int = 7) -> torch.Tensor:
+        """Rotor(또는 rotation proxy) 채널의 지역 분산(variance) 추정.
+
+        - Architecture.md §4.2의 '지역 rotor variance'를 구현 코드 입력 형식에 맞춰 근사합니다.
+        - 여기서 rotor_field는 (B,1,H,W) 또는 (B,H,W) 스칼라로 가정합니다.
+
+        Returns:
+            var_map: (B,H,W)
+        """
+        if rotor_field.dim() == 3:
+            rotor_field = rotor_field.unsqueeze(1)  # (B,1,H,W)
+
+        pad = window // 2
+        mean = F.avg_pool2d(rotor_field, kernel_size=window, stride=1, padding=pad)
+        mean_sq = F.avg_pool2d(rotor_field ** 2, kernel_size=window, stride=1, padding=pad)
+        var = (mean_sq - mean ** 2).clamp(min=0.0)
+        return var.squeeze(1)
+
+    def compute_vector_magnitude_map(self, vector_field: torch.Tensor) -> torch.Tensor:
+        """Vector field magnitude (Architecture.md §4.2 - feature magnitude)."""
+        # vector_field: (B,2,H,W)
+        vx = vector_field[:, 0, :, :]
+        vy = vector_field[:, 1, :, :]
+        mag = torch.sqrt(vx ** 2 + vy ** 2 + self.epsilon)
+        return mag
+
+    def build_priority_map_from_features(self, src_dict: Dict, tgt_dict: Optional[Dict] = None,
+                                         window: int = 7) -> torch.Tensor:
+        """priority_map 자동 생성.
+
+        - src(및 선택적으로 tgt)에서 rotor variance / vector magnitude를 계산하여
+          compute_priority_map()에 투입합니다.
+        - tgt_dict를 함께 주면, src/tgt의 통계치를 평균내어 더 안정적으로 만들 수 있습니다.
+
+        Returns:
+            priority_map: (B,H,W) in [0,1]
+        """
+        src = self._normalize_features(src_dict)
+        rotor_var = self.compute_rotor_variance_map(src['rotor'], window=window)
+        feat_mag = self.compute_vector_magnitude_map(src['vector'])
+
+        if tgt_dict is not None:
+            tgt = self._normalize_features(tgt_dict)
+            rotor_var_t = self.compute_rotor_variance_map(tgt['rotor'], window=window)
+            feat_mag_t = self.compute_vector_magnitude_map(tgt['vector'])
+            rotor_var = 0.5 * (rotor_var + rotor_var_t)
+            feat_mag = 0.5 * (feat_mag + feat_mag_t)
+
+        return self.compute_priority_map(rotor_var, feat_mag)
+
+
     def compute_priority_map(self, rotor_variance: torch.Tensor, 
                              feature_magnitude: torch.Tensor) -> torch.Tensor:
         """Compute spatial priority map for weighted optimization"""
@@ -292,6 +404,13 @@ class GeometricMPCRefiner(nn.Module):
         scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
         
         loss_history = []
+        # -----------------------------------------------------------------
+        # [Architecture.md §4.2] priority_map이 없으면 자동 생성 (optional)
+        # -----------------------------------------------------------------
+        if (priority_map is None) and self.config.get('use_priority', True):
+            priority_map = self.build_priority_map_from_features(src_dict, tgt_dict, window=7)
+            if self.config.get('verbose', False):
+                print("  [Phase 4] priority_map auto-generated from rotor variance & vector magnitude")
         patience_counter = 0
         
         if self.config['verbose']:

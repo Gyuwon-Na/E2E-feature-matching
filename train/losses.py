@@ -1,3 +1,89 @@
+# =============================================================================
+# [ARCHITECTURE MAPPING (Phase5 + Addendum 6.5)]
+# =============================================================================
+# [ARCH L0481] ## **📂 5: 통합 기하학적 손실 함수 (Unified Geometric Loss)** -> UnifiedGeometricLoss.forward
+# [ARCH L0482]  -> UnifiedGeometricLoss / component losses
+# [ARCH L0483] 모델의 최종 학습 목표는 아래의 **단일 통합 수식**을 최소화하는 것입니다. -> UnifiedGeometricLoss / component losses
+# [ARCH L0484]  -> UnifiedGeometricLoss / component losses
+# [ARCH L0485] $$L_{total} = \alpha \sum_{p \in \Omega} \underbrace{\left( L_{s}(p) + L_{v\_local}(p) + L_{b\_local}(p) \right)}_{\text{Geometric Accuracy (Local-Aware)}} + \beta \underbrace{\left( \lambda_c L_{\text{SmoothL1}} + \lambda_s L_{\text{SDF-Photo}} \right)}_{\text{Final Consistency}} + \gamma \underbrace{\left( L_{convergence} + L_{multi\_scale} \right)}_{\text{Iterative Stability}}$$ -> FinalConstraintLoss.forward
+# [ARCH L0486]  -> UnifiedGeometricLoss / component losses
+# [ARCH L0487] ### **1. Geometric Accuracy (기하학적 정밀도)** -> losses.py (section entry)
+# [ARCH L0488]  -> UnifiedGeometricLoss / component losses
+# [ARCH L0489] 이미지 A와 정답 변환($W_{GT}$)으로 되돌린 이미지 B의 특징들이 물리적으로 일치하는지 검사 -> UnifiedGeometricLoss / component losses
+# [ARCH L0490]  -> UnifiedGeometricLoss / component losses
+# [ARCH L0491] - **$L_s$ (뼈대 일치):** -> GeometricAccuracyLoss.forward (L_s)
+# [ARCH L0492]  -> UnifiedGeometricLoss / component losses
+# [ARCH L0493]     $$  L_s(p) = \| S_A(p) - S_B(W_{GT}(p)) \|^2$$ -> GeometricAccuracyLoss.forward (L_s)
+# [ARCH L0494]  -> UnifiedGeometricLoss / component losses
+# [ARCH L0495]     - **의미:** Softplus로 살려낸 SDF와 에너지가 정답 위치에서 정확히 겹쳐야 함 -> UnifiedGeometricLoss / component losses
+# [ARCH L0496] - **$L_v$ (방향 정렬)** -> GeometricAccuracyLoss.forward (L_v + local rotation)
+# [ARCH L0497]  -> UnifiedGeometricLoss / component losses
+# [ARCH L0498]     $$  L_{v\_local}(p) = \| V_A(p) - \underbrace{\mathcal{R}_{loc}(W_{GT}, p)}_{\text{Jacobian Rotation}} \cdot V_B(W_{GT}(p)) \|^2$$ -> FinalConstraintLoss.forward
+# [ARCH L0499]  -> UnifiedGeometricLoss / component losses
+# [ARCH L0500]     - 단순히 전체 행렬 $W_{GT}$를 곱하는 것이 아니라, $W_{GT}$**의 Jacobian(미분값)을 통해 각 픽셀 위치에서의 '국소 회전량(Local Rotation)'을 계산**하여 적용. -> FinalConstraintLoss.forward
+# [ARCH L0501]     - **의미:** 이미지가 회전했다면, 그 안의 엣지(V)도 그 각도만큼 물리적으로 회전했음을 학습합니다. -> UnifiedGeometricLoss / component losses
+# [ARCH L0502] - **$L_b$ (회전 일관성)** -> GeometricAccuracyLoss.forward (L_b: orientation+mag)
+# [ARCH L0503]  -> UnifiedGeometricLoss / component losses
+# [ARCH L0504]     $$  L_{b\_local}(p) = \| \text{Rotor}_A(p) - \mathcal{R}_{loc}(W_{GT}, p) \cdot \text{Rotor}_B(W_{GT}(p)) \|^2$$ -> GeometricAccuracyLoss.forward (L_b: orientation+mag)
+# [ARCH L0505]  -> UnifiedGeometricLoss / component losses
+# [ARCH L0506]     - $W_{GT}$에서 유도된 **지역적 회전(Local Rotor)** 정보와 비교 -> GeometricAccuracyLoss.forward (L_b: orientation+mag)
+# [ARCH L0507]     - **의미:** 지역적인 Sin/Cos 정보가 전체 변환 행렬(W)의 회전량과 기하학적으로 호응해야 합니다. -> UnifiedGeometricLoss / component losses
+# [ARCH L0508]  -> UnifiedGeometricLoss / component losses
+# [ARCH L0509] ### **2. Final Consistency (뒤틀림 일관성)** -> FinalConstraintLoss.forward
+# [ARCH L0510]  -> UnifiedGeometricLoss / component losses
+# [ARCH L0511] 모델이 예측한 $W^*$가 수학적으로 얼마나 견고한지 증명합니다. -> UnifiedGeometricLoss / component losses
+# [ARCH L0512]  -> UnifiedGeometricLoss / component losses
+# [ARCH L0513] - **$L_{coord}$ (모서리 거리) — Smooth L1**을 사용하여 예측된 $W^*$로 변환한 네 모서리 좌표와 정답 좌표 사이의 거리를 줄임 -> UnifiedGeometricLoss / component losses
+# [ARCH L0514]  -> UnifiedGeometricLoss / component losses
+# [ARCH L0515]     $$  L_{coord}(W_{GT}, W^*) = \frac{1}{4} \sum_{k=1}^{4} \rho \left( \mathcal{T}(p_k; W_{GT}) - \mathcal{T}(p_k; W^*) \right)$$ -> UnifiedGeometricLoss / component losses
+# [ARCH L0516]  -> UnifiedGeometricLoss / component losses
+# [ARCH L0517]     - $\mathcal{T}(p; W)$ : 좌표 p를 호모그래피 행렬 W를 이용해 변환하는 함수 -> UnifiedGeometricLoss / component losses
+# [ARCH L0518]     - $\rho(x)$ : 거리 함수 -> UnifiedGeometricLoss / component losses
+# [ARCH L0519]  -> UnifiedGeometricLoss / component losses
+# [ARCH L0520]         $$  \rho(x) =  -> UnifiedGeometricLoss / component losses
+# [ARCH L0521]           \begin{cases}  -> UnifiedGeometricLoss / component losses
+# [ARCH L0522]           0.5 x^2 / \beta & \text{if } |x| < \beta \\ -> UnifiedGeometricLoss / component losses
+# [ARCH L0523]           |x| - 0.5 \beta & \text{otherwise} -> UnifiedGeometricLoss / component losses
+# [ARCH L0524]           \end{cases}$$ -> UnifiedGeometricLoss / component losses
+# [ARCH L0525]  -> UnifiedGeometricLoss / component losses
+# [ARCH L0526] - **$L_{sdf\_photo}$ (SDF 기반 복원) —** 복원된 이미지 $\hat{A}$의 SDF가 원본 A의 SDF와 일치하는가 확인 -> UnifiedGeometricLoss / component losses
+# [ARCH L0527]  -> UnifiedGeometricLoss / component losses
+# [ARCH L0528]     $$  L_{sdf\_photo}={\sum_{p \in \Omega} \| SDF_A(p) - SDF_{\hat{A}}(p; W^*) \|^2}$$ -> UnifiedGeometricLoss / component losses
+# [ARCH L0529]  -> UnifiedGeometricLoss / component losses
+# [ARCH L0530]  -> UnifiedGeometricLoss / component losses
+# [ARCH L0531] ### **3. Iterative & Multi-Scale Constraint (반복 및 스케일 안정성) — [보완] 신규** -> losses.py (section entry)
+# [ARCH L0532]  -> UnifiedGeometricLoss / component losses
+# [ARCH L0533] 반복 정제(Iterative Refinement)와 다중 해상도(Multi-Scale) 학습 과정에서 모델이 발산하지 않고 올바른 방향으로 수렴하도록 강제하는 제약 조건입니다. -> UnifiedGeometricLoss / component losses
+# [ARCH L0534]  -> UnifiedGeometricLoss / component losses
+# [ARCH L0535] - **$L_{convergence}$ (수렴 유도 손실)** -> UnifiedGeometricLoss / component losses
+# [ARCH L0536]  -> UnifiedGeometricLoss / component losses
+# [ARCH L0537]     각 반복 단계($k$)에서 추정된 잔차 변환 $\Delta W^{(k)}$가 점차 Identity ($I$) 에 가까워지도록 유도하여, 불필요한 진동을 억제합니다. -> UnifiedGeometricLoss / component losses
+# [ARCH L0538]  -> UnifiedGeometricLoss / component losses
+# [ARCH L0539]     $$  L_{convergence} = \sum_{k=2}^{K} w_k \cdot \| \Delta W^{(k)} - I \|_F^2$$ -> UnifiedGeometricLoss / component losses
+# [ARCH L0540]  -> UnifiedGeometricLoss / component losses
+# [ARCH L0541]     - $w_k = k / K$: 반복 횟수가 증가할수록 가중치를 높여(Linear Warm-up), 후반부에는 큰 변화 대신 미세 조정만 수행하도록 강제합니다. -> UnifiedGeometricLoss / component losses
+# [ARCH L0542]     - $\| \cdot \|_F$: Frobenius Norm (행렬 원소 간 차이의 제곱합) -> UnifiedGeometricLoss / component losses
+# [ARCH L0543]     - **의미:** "첫 번째 반복에서 큰 틀을 잡고(Coarse), 이후에는 얌전히 다듬기만 해라(Fine)"는 지침을 줍니다. -> UnifiedGeometricLoss / component losses
+# [ARCH L0544] - **$L_{multi\_scale}$ (다중 스케일 일관성 손실)** -> UnifiedGeometricLoss / component losses
+# [ARCH L0545]  -> UnifiedGeometricLoss / component losses
+# [ARCH L0546]     저해상도(Coarse)에서 추정한 변환이 고해상도(Fine)에서도 유효하도록, 스케일 간의 예측값 일관성을 유지합니다. -> UnifiedGeometricLoss / component losses
+# [ARCH L0547]  -> UnifiedGeometricLoss / component losses
+# [ARCH L0548]     $$  L_{multi\_scale} = \sum_{l=0}^{L-1} \| W^{(l)} - \text{Upsample}(W^{(l+1)}) \|^2$$ -> UnifiedGeometricLoss / component losses
+# [ARCH L0549]  -> UnifiedGeometricLoss / component losses
+# [ARCH L0550]     - **의미:** "작은 이미지에서 30도 돌렸으면, 큰 이미지에서도 30도 돌아가야 한다"는 물리적 일관성을 보장합니다. 이는 Coarse-to-Fine 전략의 허리 역할을 합니다. -> UnifiedGeometricLoss / component losses
+# [ARCH L0602] ### 6.5 Loss / Training 구현 메모 -> losses.py (section entry)
+# [ARCH L0603]  -> UnifiedGeometricLoss / component losses
+# [ARCH L0604] - losses.py 의 `UnifiedGeometricLoss` 는 architecture.md §5의 큰 구조(Geo + Final + Iter)를 유지하면서,   -> FinalConstraintLoss.forward
+# [ARCH L0605]   학습 안정성을 위해 아래 항목을 추가/보강합니다: -> UnifiedGeometricLoss / component losses
+# [ARCH L0606]   - `L_angle` (pred angle ↔ gt angle 직접 loss) -> UnifiedGeometricLoss / component losses
+# [ARCH L0607]   - `L_pixel` (scalar feature consistency) -> GeometricAccuracyLoss.forward (L_s)
+# [ARCH L0608]   - `L_rotation_invariant` (±60° 구간에서 회전 불변성/대칭성 강제) -> FinalConstraintLoss.forward
+# [ARCH L0609] - `normalize_rotor_output()` 헬퍼로 cos/sin unit-normalization을 표준화합니다. -> normalize_rotor_output
+# [ARCH L0610]  -> UnifiedGeometricLoss / component losses
+# [ARCH L0611] --- -> UnifiedGeometricLoss / component losses
+# [ARCH L0612]  -> UnifiedGeometricLoss / component losses
+# =============================================================================
+
 """
 ================================================================================
 Phase 5: 통합 기하학적 손실 함수 (Unified Geometric Loss) - v5 RTX 3090 Optimized
@@ -75,61 +161,109 @@ class GeometricAccuracyLoss(nn.Module):
         Args:
             S_A, S_B: Scalar features (B, C, H, W)
             V_A, V_B: Vector features (B, C, 2, H, W)
-            B_A, B_B: Bivector (Rotor Magnitude) (B, C, H, W)
+
+            B_A, B_B:
+                - (권장) Phase2 rotor tuple: (unit_cos, unit_sin, rotor_mag) where each is (B, C, H, W)
+                - (호환) Tensor rotor_mag only: (B, C, H, W)
+
             W_gt: Ground Truth Transform (B, 2, 3)
-            
+
         Returns:
             L_geo: 기하학적 정밀도 손실
             loss_dict: 개별 손실 딕셔너리
         """
         B, C, H, W = S_A.shape
-        
+        eps = 1e-6
+
+        # -------------------------------------------------------------
+        # Bivector/Rotor 입력 파싱 (tuple or tensor)
+        # -------------------------------------------------------------
+        if isinstance(B_A, (tuple, list)) and len(B_A) == 3:
+            cos_A, sin_A, mag_A = B_A
+        else:
+            cos_A, sin_A, mag_A = None, None, B_A
+
+        if isinstance(B_B, (tuple, list)) and len(B_B) == 3:
+            cos_B, sin_B, mag_B = B_B
+        else:
+            cos_B, sin_B, mag_B = None, None, B_B
+
         # W_gt로 Sampling Grid 생성
         grid = F.affine_grid(W_gt, [B, C, H, W], align_corners=False)
-        
+
         # =====================================================================
         # [§5.1.1] L_s (뼈대 일치)
         # L_s(p) = ||S_A(p) - S_B(W_GT(p))||²
         # =====================================================================
         S_B_warped = F.grid_sample(S_B, grid, align_corners=False, mode='bilinear')
         L_s = F.mse_loss(S_A, S_B_warped)
-        
+
         # =====================================================================
         # [§5.1.2] L_v (방향 정렬) - Local Rotation 적용
         # L_v(p) = ||V_A(p) - R_loc · V_B(W_GT(p))||²
         # =====================================================================
-        # V_B를 워핑
         V_B_flat = V_B.view(B, -1, H, W)  # (B, C*2, H, W)
         V_B_warped_flat = F.grid_sample(V_B_flat, grid, align_corners=False)
         V_B_warped = V_B_warped_flat.view(B, C, 2, H, W)
-        
-        # 국소 회전 적용
-        R_loc = self.compute_local_rotation(W_gt)  # (B, 2, 2)
-        
+
+        # 국소 회전(2x2) 적용
+        A_loc = self.compute_local_rotation(W_gt)  # (B, 2, 2)
+
         # V_B_warped의 벡터 성분에 회전 적용
-        # (B, C, 2, H, W) -> (B, C, H, W, 2) -> matmul -> (B, C, H, W, 2)
         V_B_warped_perm = V_B_warped.permute(0, 1, 3, 4, 2)  # (B, C, H, W, 2)
-        V_B_rotated = torch.einsum('bij,bchwj->bchwi', R_loc, V_B_warped_perm)
+        V_B_rotated = torch.einsum('bij,bchwj->bchwi', A_loc, V_B_warped_perm)
         V_B_rotated = V_B_rotated.permute(0, 1, 4, 2, 3)  # (B, C, 2, H, W)
-        
+
         L_v = F.mse_loss(V_A, V_B_rotated)
-        
+
         # =====================================================================
-        # [§5.1.3] L_b (회전 일관성) - Local Rotor와 비교
-        # L_b(p) = ||Rotor_A(p) - R_loc · Rotor_B(W_GT(p))||²
+        # [§5.1.3] L_b (회전/스케일 일관성) - Local Rotor 비교
+        #
+        # Architecture.md 식:
+        #   L_b(p) = ||Rotor_A(p) - R_loc · Rotor_B(W_GT(p))||²
+        #
+        # 구현:
+        #   - rotor_mag: 스케일/강도 일관성 (기존 구현 유지)
+        #   - unit_cos/unit_sin: 회전 방향 일관성 (신규 보강)
         # =====================================================================
-        B_B_warped = F.grid_sample(B_B, grid, align_corners=False)
-        
-        # Rotor는 Magnitude이므로 스케일 보정만 (회전과 무관)
-        L_b = F.mse_loss(B_A, B_B_warped)
-        
+        # magnitude alignment (기존과 동일)
+        mag_B_warped = F.grid_sample(mag_B, grid, align_corners=False)
+        L_b_mag = F.mse_loss(mag_A, mag_B_warped)
+
+        # orientation alignment (가능할 때만)
+        L_b_orient = torch.tensor(0.0, device=S_A.device)
+        if (cos_A is not None) and (sin_A is not None) and (cos_B is not None) and (sin_B is not None):
+            cos_B_warped = F.grid_sample(cos_B, grid, align_corners=False)
+            sin_B_warped = F.grid_sample(sin_B, grid, align_corners=False)
+
+            # A_loc은 scale*rotation일 수 있으므로, 회전 성분만 정규화해서 사용
+            # scale = sqrt(a^2 + c^2)  (a=W[0,0], c=W[1,0])
+            a = A_loc[:, 0, 0]
+            c = A_loc[:, 1, 0]
+            scale = torch.sqrt(a * a + c * c + eps)
+            cos_r = (a / scale).view(B, 1, 1, 1)
+            sin_r = (c / scale).view(B, 1, 1, 1)
+
+            # (cos, sin) 벡터로 간주해 회전 적용
+            cos_B_rot = cos_r * cos_B_warped - sin_r * sin_B_warped
+            sin_B_rot = sin_r * cos_B_warped + cos_r * sin_B_warped
+
+            L_b_cos = F.mse_loss(cos_A, cos_B_rot)
+            L_b_sin = F.mse_loss(sin_A, sin_B_rot)
+            L_b_orient = 0.5 * (L_b_cos + L_b_sin)
+
+        # 최종 L_b: magnitude + orientation
+        L_b = L_b_mag + L_b_orient
+
         # 총합
         L_geo = LAMBDA_SCALAR * L_s + LAMBDA_VECTOR * L_v + LAMBDA_BIVECTOR * L_b
-        
+
         return L_geo, {
             'L_s': L_s.item(),
             'L_v': L_v.item(),
-            'L_b': L_b.item()
+            'L_b': L_b.item(),
+            'L_b_mag': L_b_mag.item(),
+            'L_b_orient': L_b_orient.item() if isinstance(L_b_orient, torch.Tensor) else float(L_b_orient),
         }
 
 
@@ -443,10 +577,9 @@ class UnifiedGeometricLoss(nn.Module):
         if phase2_a_tuple is not None and phase2_b_tuple is not None:
             S_A, V_A, B_A_tuple = phase2_a_tuple
             S_B, V_B, B_B_tuple = phase2_b_tuple
-            B_A = B_A_tuple[2]  # Rotor Magnitude
-            B_B = B_B_tuple[2]
-            
-            L_geo, geo_dict = self.geo_loss(S_A, V_A, B_A, S_B, V_B, B_B, W_gt)
+            # B는 (unit_cos, unit_sin, rotor_mag) tuple 전체를 전달하여
+            # L_b에서 방향(cos/sin) + 크기(mag) 일관성을 함께 강제합니다.
+            L_geo, geo_dict = self.geo_loss(S_A, V_A, B_A_tuple, S_B, V_B, B_B_tuple, W_gt)
             loss_dict.update(geo_dict)
         
         # =====================================================================

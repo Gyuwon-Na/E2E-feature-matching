@@ -1,3 +1,12 @@
+# =============================================================================
+# [ARCHITECTURE MAPPING (Training §7.5)]
+# =============================================================================
+# [ARCH L0637] ### 7.5 fast_finetune.py -> fast_finetune.py (section entry)
+# [ARCH L0638]  -> fast_finetune.py
+# [ARCH L0639] - 빠른 실험을 위해 fine_tune의 일부 상수(에폭, 샘플 수, 회전 범위 등)를 monkey patch하여 재사용합니다. -> fast_finetune.py (override constants)
+# [ARCH L0640] - 핵심 학습 루프 로직은 fine_tune.py 와 동일한 손실/지표 구조를 유지합니다. -> import fine_tune + reuse training loop
+# =============================================================================
+
 """
 ================================================================================
 Fast Fine-Tuning: Large Angle Specialist (Detailed Logging Ver.)
@@ -59,22 +68,8 @@ def train_one_epoch_detailed(embedder, transformer, dataloader, optimizer, crite
             phase2_a = embedder(pyramid_a_raw, device)
             phase2_b = embedder(pyramid_b_raw, device)
             results = transformer(phase2_a, phase2_b)
-            
-            finest_res = results[0]
-            dense_rotor = finest_res['rotor_map']
-            avg_rotor = dense_rotor.mean(dim=(1, 2))
-            
-            cos_raw = avg_rotor[:, 0]
-            sin_raw = avg_rotor[:, 1]
-            dx = avg_rotor[:, 2]
-            dy = avg_rotor[:, 3]
-            
-            from losses import normalize_rotor_output
-            cos_t, sin_t = normalize_rotor_output(cos_raw, sin_raw)
-            
-            row1 = torch.stack([cos_t, -sin_t, dx], dim=1)
-            row2 = torch.stack([sin_t, cos_t, dy], dim=1)
-            pred_W = torch.stack([row1, row2], dim=1)
+            # Phase3 outputs → pred_W(A→B) + unit rotor(cos/sin)
+            pred_W, cos_t, sin_t, finest_res = fine_tune.extract_pred_transform_from_phase3(results)
             
             loss, _ = criterion(
                 pred_W, w_gt, cos_t, sin_t, gt_angle,

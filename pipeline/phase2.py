@@ -1,3 +1,90 @@
+# =============================================================================
+# Architecture.md Line Mapping (원본 architecture.md 기준)
+# - 각 라인이 코드의 어느 부분에 해당하는지 anchor로 명시합니다.
+# - (요청사항) architecture.md 내용을 스킵/생략하지 않기 위해, 빈 줄도 포함합니다.
+# =============================================================================
+# [ARCH L0055] (CliffordPyramidEmbedder.forward / CliffordComponentEmbedding.forward) ## **📂  2: Clifford Embedding & Pyramid 생성**
+# [ARCH L0056] (CliffordPyramidEmbedder.forward / CliffordComponentEmbedding.forward) 
+# [ARCH L0057] (CliffordPyramidEmbedder.forward / CliffordComponentEmbedding.forward) <aside>
+# [ARCH L0058] (CliffordPyramidEmbedder.forward / CliffordComponentEmbedding.forward) 
+# [ARCH L0059] (CliffordPyramidEmbedder.forward / CliffordComponentEmbedding.forward) - **입력:** Phase 1에서 리사이즈된 이미지들
+# [ARCH L0060] (CliffordPyramidEmbedder.forward / CliffordComponentEmbedding.forward) - **출력:** 각 해상도에 최적화된 **Clifford 특징 세트 (S, V, B)**
+# [ARCH L0061] (CliffordPyramidEmbedder.forward / CliffordComponentEmbedding.forward) - **용도:**
+# [ARCH L0062] (CliffordPyramidEmbedder.forward / CliffordComponentEmbedding.forward)     - **Encoder Input:** Phase 3 인코더가 이미지의 맥락을 파악하는 기초 자료로 활용.
+# [ARCH L0063] (CliffordPyramidEmbedder.forward / CliffordComponentEmbedding.forward)     - **Decoder Skip-Connection:** 업샘플링 과정에서 원본의 날카로운 기하학을 다시 수혈하기 위한 대조군으로 활용.
+# [ARCH L0064] (CliffordPyramidEmbedder.forward / CliffordComponentEmbedding.forward) </aside>
+# [ARCH L0065] (CliffordPyramidEmbedder.forward / CliffordComponentEmbedding.forward) 
+# [ARCH L0066] (CliffordPyramidEmbedder.forward / CliffordComponentEmbedding.forward) Phase 1에서 준비된 해상도별 물리량(S, V, B 후보)을 입력받아, 고차원 공간에서의 **멀티벡터 임베딩**을 완성. 이 결과물은 Phase 3의 디코더가 필요할 때마다 즉시 꺼내 쓸 수 있는 '기하학적 정답 창고(Pyramid)'가 됩니다.
+# [ARCH L0067] (CliffordPyramidEmbedder.forward / CliffordComponentEmbedding.forward) 
+# [ARCH L0068] (CliffordComponentEmbedding: proj_s + s_mixer (scalar embedding)) ### **1. S (Scalar) 임베딩: 에너지 보존과 확률적 해석**
+# [ARCH L0069] (CliffordComponentEmbedding: proj_s + s_mixer (scalar embedding)) 
+# [ARCH L0070] (CliffordComponentEmbedding: proj_s + s_mixer (scalar embedding)) - **핵심 기법:** **Softplus + Learnable Scaling**
+# [ARCH L0071] (CliffordComponentEmbedding: proj_s + s_mixer (scalar embedding)) - **선택 이유:**
+# [ARCH L0072] (CliffordComponentEmbedding: proj_s + s_mixer (scalar embedding))     - **정보 보존력:** 음수 입력이나 미세한 신호도 0으로 깎아버리지 않고 부드럽게 살려두어, 아주 미약한 기하학적 단서라도 모델이 판단 근거로 삼을 수 있게 함
+# [ARCH L0073] (CliffordComponentEmbedding: proj_s + s_mixer (scalar embedding))     - **미분 특성:** 미분 시 Sigmoid 형태가 되어, 학습 과정에서 게이팅(Gating) 효과를 자연스럽게 유도합니다.
+# [ARCH L0074] (CliffordComponentEmbedding: proj_s + s_mixer (scalar embedding)) 
+# [ARCH L0075] (CliffordComponentEmbedding: proj_v (vector embedding)) ### **2. V (Vector) 임베딩: 방향의 순수성 유지**
+# [ARCH L0076] (CliffordComponentEmbedding: proj_v (vector embedding)) 
+# [ARCH L0077] (CliffordComponentEmbedding: proj_v (vector embedding)) - **핵심 기법:** **Linear Projection (No Bias)**
+# [ARCH L0078] (CliffordComponentEmbedding: proj_v (vector embedding)) - **의미:** 벡터는 '어디로 향하는가'라는 방향 정보가 본질입니다.
+# [ARCH L0079] (CliffordComponentEmbedding: proj_v (vector embedding)) - **설계 의도:** 활성화 함수로 방향을 왜곡하지 않고, Phase 1에서 추출된 그레이디언트와 텍스처 흐름을 고차원 채널로 확장하여 **벡터 특유의 선형성과 기하학적 성질**을 그대로 보존
+# [ARCH L0080] (CliffordComponentEmbedding: proj_v (vector embedding)) 
+# [ARCH L0081] (CliffordComponentEmbedding: proj_rotor + unit rotor normalization + global gate) ### **3. B (Bivector) Generation: 회전과 닮음의 수치화**
+# [ARCH L0082] (CliffordComponentEmbedding: proj_rotor + unit rotor normalization + global gate) 
+# [ARCH L0083] (CliffordComponentEmbedding: proj_rotor + unit rotor normalization + global gate) - **핵심 기법:** **Sin/Cos Pair Output**
+# [ARCH L0084] (CliffordComponentEmbedding: proj_rotor + unit rotor normalization + global gate) - **선택 이유:**
+# [ARCH L0085] (CliffordComponentEmbedding: proj_rotor + unit rotor normalization + global gate)     - **회전의 정석:** 단순히 Tanh()로 값을 제한하는 대신, 수학적으로 완벽한 회전을 표현하는 `Sin/Cos` 쌍을 직접 생성.
+# [ARCH L0086] (CliffordComponentEmbedding: proj_rotor + unit rotor normalization + global gate)     - **설계 의도:** 아핀 변환(Affine Transform)이나 줌(Zoom)이 발생한 이미지 매칭에서 압도적인 성능을 보일 것이라 예측
+# [ARCH L0087] (CliffordComponentEmbedding: proj_rotor + unit rotor normalization + global gate)     - **기하학적 분리**
+# [ARCH L0088] (CliffordComponentEmbedding: proj_rotor + unit rotor normalization + global gate)         - **sin 성분:** 두 특징 사이의 **'다름(외적/회전)'**을 나타내며 Bivector의 핵심 값이 됩니다.
+# [ARCH L0089] (CliffordComponentEmbedding: proj_rotor + unit rotor normalization + global gate)         - **cos 성분:** 두 특징 사이의 **'닮음(내적/일치)'**을 나타내며 Scalar에 더해져 유사도 판정을 돕습니다.
+# [ARCH L0090] (CliffordComponentEmbedding: proj_rotor + unit rotor normalization + global gate) 
+# [ARCH L0091] (CliffordComponentEmbedding: proj_rotor + unit rotor normalization + global gate)         - **Unit Rotor 분리 (Magnitude Normalization):**
+# [ARCH L0092] (CliffordComponentEmbedding: proj_rotor + unit rotor normalization + global gate) 
+# [ARCH L0093] (CliffordComponentEmbedding: proj_rotor + unit rotor normalization + global gate)         $$\text{Rotor Magnitude} = |R| = \sqrt{\cos^2 + \sin^2 + \epsilon}$$
+# [ARCH L0094] (CliffordComponentEmbedding: proj_rotor + unit rotor normalization + global gate) 
+# [ARCH L0095] (CliffordComponentEmbedding: proj_rotor + unit rotor normalization + global gate)         $$\text{Unit Rotor} = \frac{R}{|R|} = \left( \frac{\cos}{|R|}, \frac{\sin}{|R|} \right)$$
+# [ARCH L0096] (CliffordComponentEmbedding: proj_rotor + unit rotor normalization + global gate) 
+# [ARCH L0097] (CliffordComponentEmbedding: proj_rotor + unit rotor normalization + global gate)         - **정규화:** 출력된 Rotor를 Unit Rotor ($R/|R|$, 순수 회전)과 Magnitude ($|R|$, 스케일) 로 **분리하여 제공**할 수 있도록 설계.
+# [ARCH L0098] (CliffordComponentEmbedding: proj_rotor + unit rotor normalization + global gate) 
+# [ARCH L0099] (CliffordComponentEmbedding: proj_rotor + unit rotor normalization + global gate)             → Phase 3에서 회전은 같은데 크기만 다른 경우를 명확히 구분
+# [ARCH L0100] (CliffordComponentEmbedding: proj_rotor + unit rotor normalization + global gate) 
+# [ARCH L0101] (CliffordComponentEmbedding: proj_rotor + unit rotor normalization + global gate)             **분리 이유:**
+# [ARCH L0102] (CliffordComponentEmbedding: proj_rotor + unit rotor normalization + global gate)             1. **Unit Rotor ($R/|R|$)**: 순수 회전 방향만 표현 → Phase 3의 Path A (Rotation Invariant Matching)에서 사용
+# [ARCH L0103] (CliffordComponentEmbedding: proj_rotor + unit rotor normalization + global gate)             2. **Magnitude ($|R|$)**: 스케일 정보만 표현 → Phase 3의 Path B (Scale Bias)에서 사용
+# [ARCH L0104] (CliffordComponentEmbedding: proj_rotor + unit rotor normalization + global gate)             3. **기하학적 독립성**: 회전과 스케일을 분리하여 각각 독립적으로 처리 가능
+# [ARCH L0105] (CliffordComponentEmbedding: proj_rotor + unit rotor normalization + global gate) 
+# [ARCH L0106] (CliffordComponentEmbedding: proj_rotor + unit rotor normalization + global gate) 
+# [ARCH L0107] (CliffordComponentEmbedding: proj_rotor + unit rotor normalization + global gate) ---
+# [ARCH L0108] (CliffordComponentEmbedding: proj_rotor + unit rotor normalization + global gate) 
+# =============================================================================
+# =============================================================================
+# [ARCH ADDENDUM §6.1-6.2 MAPPING]
+# =============================================================================
+# [ARCH L0554] ## 📌 6: Code Implementation Notes (v5 / Code-Architecture Sync) -> phase2.py (implementation detail)
+# [ARCH L0555]  -> phase2.py (implementation detail)
+# [ARCH L0556] > 이 섹션은 **architecture.md(개념 설계)** 와 **현재 코드 구현(phase1~phase4_2, losses, fine_tune/fast_finetune)** 사이의 차이를 없애기 위해,   -> phase2.py (implementation detail)
+# [ARCH L0557] > 코드에 존재하지만 본문에 상세히 없던 구현 포인트/하이퍼파라미터를 문서화한 **"Implementation Addendum"** 입니다. -> phase2.py (implementation detail)
+# [ARCH L0558]  -> phase2.py (implementation detail)
+# [ARCH L0559] ### 6.1 공통 하이퍼파라미터 (코드 기본값) -> phase2.py (addendum entry)
+# [ARCH L0560]  -> phase2.py (implementation detail)
+# [ARCH L0561] - `HIDDEN_DIM = 48`  *(Phase 2 Clifford Embedding 기본 채널 수)* -> phase2.py/phase3.py hyperparams (HIDDEN_DIM/FEATURE_DIM/levels)
+# [ARCH L0562] - `FEATURE_DIM = 144 (= 3 × 48)` *(Phase 3 Transformer 내부 S/V/B concat 특징 차원)* -> phase2.py/phase3.py hyperparams (HIDDEN_DIM/FEATURE_DIM/levels)
+# [ARCH L0563] - `NUM_ENCODER_LAYERS = 3`, `NUM_ATTENTION_HEADS = 4` -> phase2.py/phase3.py hyperparams (HIDDEN_DIM/FEATURE_DIM/levels)
+# [ARCH L0564] - `pyramid levels = 5` *(fine_tune.py 기본 학습 설정: 큰 회전(±60°) 대응을 위해 4→5로 확장)* -> phase2.py/phase3.py hyperparams (HIDDEN_DIM/FEATURE_DIM/levels)
+# [ARCH L0565]  -> phase2.py (implementation detail)
+# [ARCH L0566] ### 6.2 Phase 2 구현 메모 -> phase2.py (addendum entry)
+# [ARCH L0567]  -> phase2.py (implementation detail)
+# [ARCH L0568] - **Rotor 생성 입력 채널 확장 (5채널):**   -> phase2.py CliffordRotorLayer.forward (rotor_in concat)
+# [ARCH L0569]   `(dx, dy, fx, fy)`(Phase1의 V1/V2) 에 더해, Phase1에서 계산한 **Bivector 후보 `bivector = v1 ∧ v2`** 를 추가하여   -> phase1.py (bivector candidate) + phase2.py rotor_in
+# [ARCH L0570]   `rotor_in = concat([v_in(4ch), b_in(1ch)])` 형태로 Rotor Conv에 투입합니다. -> phase2.py (implementation detail)
+# [ARCH L0571] - **Scalar 업데이트 방식(s_mixer):**   -> phase2.py CliffordComponentEmbedding.forward (s_mixer)
+# [ARCH L0572]   Cos 파트를 scalar embedding에 단순 가산하기보다, `concat([s_emb, cos_part]) → 1×1 Conv(s_mixer)` 로 **혼합**하여   -> phase2.py CliffordComponentEmbedding.forward (s_mixer)
+# [ARCH L0573]   과도한 덮어쓰기(override)와 스케일 폭주를 줄입니다. -> phase2.py (implementation detail)
+# [ARCH L0574]  -> phase2.py (implementation detail)
+# =============================================================================
+
+
 """
 ================================================================================
 Phase 2: Clifford Embedding & Pyramid 생성
@@ -126,7 +213,7 @@ class CliffordComponentEmbedding(nn.Module):
         # 
         # Bias=True 이유: Rotor는 변환(Transformation)이므로 편향을 통해 
         # 기본 상태(Identity)나 특정 초기 회전값을 학습 가능
-        self.proj_rotor = nn.Conv2d(4, hidden_dim * 2, kernel_size=1, bias=True)
+        self.proj_rotor = nn.Conv2d(5, hidden_dim * 2, kernel_size=1, bias=True)  # (dx,dy,fx,fy,bivector)
 
         # =====================================================================
         # [§2.4] Global Context Injection (Option)
@@ -158,6 +245,18 @@ class CliffordComponentEmbedding(nn.Module):
         sdf = sdf[..., np.newaxis]  # (..., 1)
         scalars_np = np.concatenate([hsi, sdf], axis=-1)  # (..., 4)
         vectors_np = data_dict['gradient']
+
+        # 2. Bivector Candidate (Phase 1) - optional
+        # Architecture.md §1.3 - B (Bivector 후보)
+        # Phase 1에서 제공되는 wedge-product 기반 회전 씨앗이 있는 경우 Rotor 생성에 함께 사용합니다.
+        b_np = data_dict.get('bivector', None)
+        if b_np is None:
+            # backward compatibility: B 후보가 없으면 0으로 채움
+            if has_batch:
+                b_np = np.zeros((hsi.shape[0], hsi.shape[1], hsi.shape[2]), dtype=np.float32)
+            else:
+                b_np = np.zeros((hsi.shape[0], hsi.shape[1]), dtype=np.float32)
+
         v_shape_np = data_dict['v_shape']
 
         if has_batch:
@@ -165,15 +264,17 @@ class CliffordComponentEmbedding(nn.Module):
             # Input: (B, H, W, C) -> Output: (B, C, H, W)
             s_tensor = torch.from_numpy(scalars_np).permute(0, 3, 1, 2).float().to(device)
             v_tensor = torch.from_numpy(vectors_np).permute(0, 3, 1, 2).float().to(device)
+            b_tensor = torch.from_numpy(b_np).unsqueeze(1).float().to(device)  # (B,1,H,W)
             g_tensor = torch.from_numpy(v_shape_np).float().to(device)
         else:
             # Case B: Inference (Single Image Input)
             # Input: (H, W, C) -> Output: (1, C, H, W)
             s_tensor = torch.from_numpy(scalars_np).permute(2, 0, 1).unsqueeze(0).float().to(device)
             v_tensor = torch.from_numpy(vectors_np).permute(2, 0, 1).unsqueeze(0).float().to(device)
+            b_tensor = torch.from_numpy(b_np).unsqueeze(0).unsqueeze(0).float().to(device)  # (1,1,H,W)
             g_tensor = torch.from_numpy(v_shape_np).unsqueeze(0).float().to(device)
 
-        return s_tensor, v_tensor, g_tensor
+        return s_tensor, v_tensor, b_tensor, g_tensor
 
     def forward(self, phase1_item, device=None):
         """
@@ -194,7 +295,7 @@ class CliffordComponentEmbedding(nn.Module):
             device = next(self.parameters()).device
 
         # 1. 데이터 준비 (GPU 전송)
-        s_in, v_in, g_in = self.to_tensor(phase1_item, device)
+        s_in, v_in, b_in, g_in = self.to_tensor(phase1_item, device)
         batch, _, h, w = s_in.shape
 
         # =====================================================================
@@ -221,7 +322,8 @@ class CliffordComponentEmbedding(nn.Module):
         # [§2.3] Rotor Embedding & Decomposition
         # =====================================================================
         # (1) Rotor 추론: 벡터 입력으로부터 변환 관계(Rotation+Scale) 추출
-        rotor_raw = self.proj_rotor(v_in)  # (B, hidden_dim*2, H, W)
+        rotor_in = torch.cat([v_in, b_in], dim=1)  # (B,5,H,W)
+        rotor_raw = self.proj_rotor(rotor_in)  # (B, hidden_dim*2, H, W)
         
         # (2) Pair 분리: Cos/Sin 쌍으로 나눔
         rotor_pair = rotor_raw.view(batch, self.hidden_dim, 2, h, w)
