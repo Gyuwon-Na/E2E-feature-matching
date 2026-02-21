@@ -94,7 +94,8 @@ class GeometricMPCRefiner(nn.Module):
             'huber_delta': 0.1,
             'warmup_iters': 10,
             'use_priority': True,
-            'verbose': True
+            'verbose': True,
+            'max_init_angle_deg': 180.0,
         }
         
         if config:
@@ -127,11 +128,12 @@ class GeometricMPCRefiner(nn.Module):
         """Initialize from Phase 3 predictions"""
         angle_deg = np.degrees(mean_rotor)
         
-        if abs(angle_deg) > 90:
-            if self.config['verbose']:
-                print(f"[Phase 4] Warning: Large init angle ({angle_deg:.1f} deg), clamping to +/-90")
-            mean_rotor = np.clip(mean_rotor, -np.pi/2, np.pi/2)
-        
+        max_deg = float(self.config.get('max_init_angle_deg', 180.0))
+        if abs(angle_deg) > max_deg:
+            if self.config.get('verbose', False):
+                print(f"[Phase 4] Warning: Large init angle ({angle_deg:.1f} deg), clamping to +/-{max_deg:.0f}")
+            max_rad = np.deg2rad(max_deg)
+            mean_rotor = np.clip(mean_rotor, -max_rad, max_rad)
         self.base_angle = float(mean_rotor)
         self.base_scale = float(np.clip(mean_scale, 0.5, 2.0))
         
@@ -326,6 +328,9 @@ class GeometricMPCRefiner(nn.Module):
         B, _, H, W_size = src['sdf'].shape
         
         # Create affine grid
+        # affine_grid의 theta 배치 차원(N)은 입력 size[0]과 일치해야 합니다.
+        if W.shape[0] != B:
+            W = W.repeat(B, 1, 1)
         grid = F.affine_grid(W, [B, 1, H, W_size], align_corners=False)
         
         # Warp source features
@@ -342,10 +347,16 @@ class GeometricMPCRefiner(nn.Module):
         valid_mask = (valid_mask > 0.5).float()
         
         # Apply rotation to warped vectors
-        rot_matrix = W[0, :2, :2]  # [2, 2]
-        vec_permuted = warped_vec.permute(0, 2, 3, 1)  # [B, H, W, 2]
-        vec_rotated = torch.einsum('ij,bhwj->bhwi', rot_matrix, vec_permuted)
-        vec_rotated = vec_rotated.permute(0, 3, 1, 2)  # [B, 2, H, W]
+        # Apply rotation to warped vectors (W: tgt->src).
+        # src 벡터를 tgt 좌표계로 맞추려면 역회전(=transpose)이 필요합니다.
+        A = W[:, :2, :2]  # [B,2,2]
+        eps = 1e-6
+        s = torch.sqrt(A[:, 0, 0]**2 + A[:, 1, 0]**2 + eps)  # scale 제거
+        R = A / s.view(-1, 1, 1)
+        R_inv = R.transpose(1, 2).contiguous()
+        vec_permuted = warped_vec.permute(0, 2, 3, 1)  # [B,H,W,2]
+        vec_rotated = torch.einsum('bij,bhwj->bhwi', R_inv, vec_permuted)
+        vec_rotated = vec_rotated.permute(0, 3, 1, 2)  # [B,2,H,W]
         
         # Energy terms
         e_scalar = self.huber_loss(warped_sdf - tgt['sdf'], self.config['huber_delta'])
@@ -358,11 +369,31 @@ class GeometricMPCRefiner(nn.Module):
         # Apply gate weights
         g_s, g_v, g_b = gates
         
-        if g_s.dim() < 4:
-            g_s = g_s.view(1, 1, 1, 1)
-            g_v = g_v.view(1, 1, 1, 1)
-            g_b = g_b.view(1, 1, 1, 1)
-        
+        # Gate shape 정리: (B,1,H,W)로 맞춰서 에너지 맵과 broadcast 가능하게 합니다.
+        def _shape_gate(g: torch.Tensor, B_: int, H_: int, W_: int) -> torch.Tensor:
+            if g is None:
+                return torch.ones((B_, 1, H_, W_), device=warped_sdf.device, dtype=warped_sdf.dtype)
+            # move to same device/dtype
+            g = g.to(device=warped_sdf.device, dtype=warped_sdf.dtype)
+            if g.dim() == 0:  # scalar
+                return g.view(1, 1, 1, 1).expand(B_, 1, H_, W_)
+            if g.dim() == 1:  # (B,) or (1,)
+                return g.view(-1, 1, 1, 1).expand(B_, 1, H_, W_)
+            if g.dim() == 2:  # (B,1) or (B,C)
+                if g.shape[1] != 1:
+                    g = g.mean(dim=1, keepdim=True)
+                return g.view(B_, 1, 1, 1).expand(B_, 1, H_, W_)
+            if g.dim() == 3:  # (B,H,W)
+                return g.unsqueeze(1)
+            if g.dim() == 4:  # (B,1,H,W)
+                if g.shape[1] != 1:
+                    g = g.mean(dim=1, keepdim=True)
+                return g
+            raise ValueError(f"Unsupported gate shape: {tuple(g.shape)}")
+
+        g_s = _shape_gate(g_s, B, H, W_size)
+        g_v = _shape_gate(g_v, B, H, W_size)
+        g_b = _shape_gate(g_b, B, H, W_size)
         # Weighted sum
         total_energy = g_s * e_scalar + g_v * e_vector + g_b * e_bivector
         

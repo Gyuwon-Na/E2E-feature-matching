@@ -114,20 +114,16 @@ sys.path.append(parent_dir)
 # =============================================================================
 # [Hyperparameters] Loss Function - v5 ±60° Optimized
 # =============================================================================
-# 가중치 재조정 (losses.py)
-LAMBDA_SCALAR = 1.0      
-LAMBDA_VECTOR = 45.0      # 50 → 30 (벡터 압박 완화)
-LAMBDA_BIVECTOR = 700.0   # 1000 → 300 (Rotor 제약 완화)
-
-BETA_COORD = 10.0         
-LAMBDA_ANGLE = 1500.0      # 2000 → 800 (각도 압박 완화)
-LAMBDA_PIXEL = 0.05       
-
-LAMBDA_ROTATION_INV = 450.0  # 800 → 200 (회전 불변성 완화)
-SMOOTH_L1_BETA = 2.5      # 2.0 → 3.0 (큰 오차 더 관용)
-
-GAMMA_CONVERGENCE = 0.5
-GAMMA_MULTISCALE = 0.3
+LAMBDA_SCALAR = 1.0           # [Hyperparameter] 스칼라 부분 가중치
+LAMBDA_VECTOR = 35.0          # [Hyperparameter] 벡터 부분 가중치 (평행이동 완화)
+LAMBDA_BIVECTOR = 800.0       # [Hyperparameter] Bivector 가중치 (회전 제약 강화) ⭐
+BETA_COORD = 8.0              # [Hyperparameter] 좌표 정확도 (회전 우선이므로 낮춤)
+LAMBDA_ANGLE = 2000.0         # [Hyperparameter] 각도 손실 가중치 - 최우선! ⭐⭐⭐
+LAMBDA_PIXEL = 0.03           # [Hyperparameter] 픽셀 오차 가중치 (낮춤)
+LAMBDA_ROTATION_INV = 600.0   # [Hyperparameter] 회전 불변성 강화 ⭐
+SMOOTH_L1_BETA = 2.0          # [Hyperparameter] 큰 각도 오차에 민감 ⭐
+GAMMA_CONVERGENCE = 0.5       # [Hyperparameter] 수렴 가중치
+GAMMA_MULTISCALE = 0.3        # [Hyperparameter] 멀티스케일 가중치
 
 class GeometricAccuracyLoss(nn.Module):
     """
@@ -149,13 +145,28 @@ class GeometricAccuracyLoss(nn.Module):
     def compute_local_rotation(self, W_gt, points=None):
         """
         [Helper] W_GT의 Jacobian을 통해 국소 회전량 계산
-        
+
         Affine Transform의 경우, Jacobian은 전역적으로 동일 (W의 2x2 부분)
+
+        ⚠️ 중요(컨벤션):
+          - W_gt는 grid_sample/affine_grid에 들어가는 theta(out->in)이며,
+            본 프로젝트에서는 Dataset에서 W_gt를 **A->B (out=A, in=B)** 로 생성합니다.
+          - B에서 샘플된 V_B를 A 좌표계의 V_A와 비교하려면,
+            벡터 성분은 **B->A** 로 회전시켜야 합니다.
+          - 따라서 여기서는 (A->B)의 역회전(=transpose)을 반환합니다.
         """
         # W_gt: (B, 2, 3)
-        # 국소 회전 행렬 = W_gt[:, :2, :2]
-        return W_gt[:, :2, :2]
-    
+        # A2B 선형부
+        A2B = W_gt[:, :2, :2]  # (B,2,2)
+        # scale 제거 후 순수 회전 추출
+        eps = 1e-6
+        s = torch.sqrt(A2B[:, 0, 0]**2 + A2B[:, 1, 0]**2 + eps)  # (B,)
+        R_A2B = A2B / s.view(-1, 1, 1)
+        # B2A = (A2B)^T (회전행렬 가정)
+        R_B2A = R_A2B.transpose(1, 2).contiguous()
+        return R_B2A
+
+
     def forward(self, S_A, V_A, B_A, S_B, V_B, B_B, W_gt):
         """
         Args:
@@ -292,11 +303,20 @@ class FinalConsistencyLoss(nn.Module):
         """
         [Helper] 2x3 Affine 행렬의 역행렬 계산
         """
+        # linalg.inv / cat 등은 dtype이 정확히 맞아야 하고,
+        # fp16에서는 수치적으로 불안정하거나 일부 디바이스에서 지원이 제한될 수 있습니다.
+        # => 역행렬 계산은 fp32로 수행한 뒤, 원래 dtype으로 되돌립니다.
         B = matrix_2x3.shape[0]
-        bottom_row = torch.tensor([0., 0., 1.], device=matrix_2x3.device).view(1, 1, 3).repeat(B, 1, 1)
-        matrix_3x3 = torch.cat([matrix_2x3, bottom_row], dim=1)
+        in_dtype = matrix_2x3.dtype
+        device = matrix_2x3.device
+
+        matrix_2x3_f = matrix_2x3.to(dtype=torch.float32)
+        bottom_row = torch.tensor([0., 0., 1.], device=device, dtype=matrix_2x3_f.dtype)
+        bottom_row = bottom_row.view(1, 1, 3).repeat(B, 1, 1)
+
+        matrix_3x3 = torch.cat([matrix_2x3_f, bottom_row], dim=1)
         matrix_inv = torch.linalg.inv(matrix_3x3)
-        return matrix_inv[:, :2, :]
+        return matrix_inv[:, :2, :].to(dtype=in_dtype)
     
     def compute_rotation_invariant_loss(self, pred_W, W_gt):
         """
@@ -305,8 +325,9 @@ class FinalConsistencyLoss(nn.Module):
         행렬의 고유값(특이값)은 회전에 불변 → 이를 비교하여 스케일 정확도 보장
         """
         # 2x2 선형 변환 부분 추출
-        pred_linear = pred_W[:, :2, :2]  # (B, 2, 2)
-        gt_linear = W_gt[:, :2, :2]
+        # (AMP 상황에서 dtype mismatch로 인한 bmm/mse 오류를 피하기 위해 fp32로 계산)
+        pred_linear = pred_W[:, :2, :2].to(dtype=torch.float32)  # (B, 2, 2)
+        gt_linear = W_gt[:, :2, :2].to(dtype=torch.float32)
         
         # 특이값 분해 (SVD) 대신 간단히 determinant 비교
         # det(R) = 1 (순수 회전) 이어야 함
@@ -318,7 +339,7 @@ class FinalConsistencyLoss(nn.Module):
         
         # 직교성 손실: R^T @ R ≈ I
         pred_RTR = torch.bmm(pred_linear.transpose(1, 2), pred_linear)
-        identity = torch.eye(2, device=pred_W.device).unsqueeze(0).repeat(pred_W.shape[0], 1, 1)
+        identity = torch.eye(2, device=pred_W.device, dtype=pred_RTR.dtype).unsqueeze(0).repeat(pred_W.shape[0], 1, 1)
         L_ortho = F.mse_loss(pred_RTR, identity)
         
         return L_det + 0.5 * L_ortho
@@ -342,14 +363,19 @@ class FinalConsistencyLoss(nn.Module):
         # =====================================================================
         # [§5.2.1] L_coord (모서리 거리) - SmoothL1
         # =====================================================================
+        # AMP로 pred_W가 fp16, W_gt가 fp32일 때 torch.bmm dtype mismatch가 날 수 있어
+        # 좌표/각도 관련 손실은 fp32로 계산합니다(grad는 정상적으로 전파됨).
+        pred_W_f = pred_W.to(dtype=torch.float32)
+        W_gt_f = W_gt.to(dtype=torch.float32)
+
         corners = torch.tensor([
-            [-1., -1., 1.], [1., -1., 1.], 
+            [-1., -1., 1.], [1., -1., 1.],
             [1., 1., 1.], [-1., 1., 1.]
-        ], device=device)
+        ], device=device, dtype=pred_W_f.dtype)
         corners = corners.unsqueeze(0).repeat(B, 1, 1).transpose(1, 2)  # (B, 3, 4)
-        
-        pts_pred = torch.bmm(pred_W, corners)  # (B, 2, 4)
-        pts_gt = torch.bmm(W_gt, corners)
+
+        pts_pred = torch.bmm(pred_W_f, corners)  # (B, 2, 4)
+        pts_gt = torch.bmm(W_gt_f, corners)
         
         L_coord = self.smooth_l1(pts_pred, pts_gt)
         
@@ -357,18 +383,32 @@ class FinalConsistencyLoss(nn.Module):
         # [§5.2.2] L_angle (각도 일치) - v5: 가중치 증가
         # L_angle = 1 - cos(pred_angle - gt_angle)
         # =====================================================================
-        pred_angle = torch.atan2(pred_sin, pred_cos)
-        L_angle = 1.0 - torch.cos(pred_angle - gt_angle_rad).mean()
+        # pred_cos/pred_sin은 이미 normalize_rotor_output()을 거친 값(권장)입니다.
+        # atan2 기반 각도 손실은 ±180° 근처(π)에서 sin(Δ)≈0로 gradient가 약해질 수 있어,
+        # cos/sin 공간에서 직접 정렬시키는 형태(내적 기반)로 변경합니다.
+        gt_angle_f = gt_angle_rad.to(dtype=torch.float32)
+        gt_cos = torch.cos(gt_angle_f)
+        gt_sin = torch.sin(gt_angle_f)
+        pred_cos_f = pred_cos.to(dtype=torch.float32)
+        pred_sin_f = pred_sin.to(dtype=torch.float32)
+        dot = (pred_cos_f * gt_cos + pred_sin_f * gt_sin).clamp(-1.0, 1.0)
+        L_angle = 1.0 - dot.mean()
         
         # =====================================================================
         # [§5.2.3] L_pixel (SDF 기반 복원) - Optional
         # =====================================================================
-        L_pixel = torch.tensor(0.0, device=device)
+        L_pixel = torch.tensor(0.0, device=device, dtype=torch.float32)
         if S_A is not None and S_B is not None:
-            pred_W_inv = self.get_inverse_affine(pred_W)
-            grid = F.affine_grid(pred_W_inv, S_B.size(), align_corners=False)
-            S_A_warped = F.grid_sample(S_A, grid, align_corners=False, padding_mode='zeros')
-            L_pixel = F.mse_loss(S_A_warped, S_B)
+            # grid_sample은 input/grid dtype이 동일해야 하므로 S_B dtype 기준으로 맞춥니다.
+            theta = self.get_inverse_affine(pred_W).to(dtype=S_B.dtype)
+            grid = F.affine_grid(theta, S_B.size(), align_corners=False)
+            S_A_warped = F.grid_sample(
+                S_A.to(dtype=grid.dtype),
+                grid,
+                align_corners=False,
+                padding_mode='zeros'
+            )
+            L_pixel = F.mse_loss(S_A_warped, S_B.to(dtype=grid.dtype))
         
         # =====================================================================
         # [v5 신규] L_rotation_inv (회전 불변량 보존)
@@ -494,10 +534,12 @@ class IterativeStabilityLoss(nn.Module):
         L_conv = torch.tensor(0.0, device=device)
         L_ms = torch.tensor(0.0, device=device)
         
-        if delta_W_list is not None:
+        # 빈 리스트([])가 들어오면 compute_* 내부에서 CPU 텐서를 반환할 수 있어
+        # (GPU 텐서와 더해질 때) device mismatch 오류가 날 수 있습니다.
+        if delta_W_list is not None and len(delta_W_list) > 0:
             L_conv = self.compute_convergence_loss(delta_W_list)
             
-        if W_predictions is not None:
+        if W_predictions is not None and len(W_predictions) > 0:
             L_ms = self.compute_multiscale_loss(W_predictions)
         
         L_iter = GAMMA_CONVERGENCE * L_conv + GAMMA_MULTISCALE * L_ms

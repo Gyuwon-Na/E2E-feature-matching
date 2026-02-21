@@ -456,7 +456,7 @@ class TransformAccumulator:
         # 합성
         W_aug = self._to_aug(self.W_accum)
         d_aug = self._to_aug(delta_mat)
-        out = torch.bmm(d_aug, W_aug)
+        out = torch.bmm(W_aug, d_aug)  # compose: W ∘ ΔW
         return out[:, :2, :]
 
     def set_current(self, W_2x3):
@@ -580,156 +580,11 @@ class IterativeRefinementLoop(nn.Module):
         if phase3_results is not None and len(phase3_results) > 0:
             # Phase3 결과 중 가장 coarse(level index가 가장 큰 것)를 사용
             coarse_res = max(phase3_results, key=lambda d: d.get('level', 0))
-            coarse_rotor = coarse_res.get('delta_rotor_map', None)
-            if coarse_rotor is None:
-                coarse_rotor = coarse_res.get('rotor_map', None)
-            if coarse_rotor is not None:
-                init_W = self.rotor_map_to_theta(coarse_rotor).detach()
-
-        accumulator = TransformAccumulator(device)
-        accumulator.reset(batch_size=B, init_W=init_W)
-
-        # Hidden state init (Level0 resolution)
-        h_s = self.gru_s.init_hidden(B, H, W, device)
-        h_v = self.gru_v.init_hidden(B, H, W, device)
-        h_b = self.gru_b.init_hidden(B, H, W, device)
-        hidden_states = {'S': h_s, 'V': h_v, 'B': h_b}
-
-        # Safety lock state
-        consecutive_rejections = 0
-        step_scale = STEP_SCALE_INIT
-
-        history = []
-
-        print(f"[Phase 3.5] Starting Iterative Refinement (max {NUM_ITERATIONS} iterations)")
-
-        for k in range(NUM_ITERATIONS):
-            W_curr = accumulator.get_current()
-
-            # 1) Current error
-            e_pos, e_angle, e_diff, feat_a_warped = self.compute_error(
-                pyramid_features_a[0], pyramid_features_b[0], W_curr
-            )
-            e_curr = e_pos.mean().item()
-
-            # 2) Target reached
-            if e_curr < TARGET_ERROR_PX:
-                print(f"  [Iter {k+1}] Target reached: {e_curr:.2f}px < {TARGET_ERROR_PX}px ✓")
-                break
-
-            # 3) Dual selection
-            selected_level, selected_feature = self.selector(e_pos, e_angle)
-
-            level_feat_a = pyramid_features_a[min(selected_level, len(pyramid_features_a)-1)]
-            level_feat_b = pyramid_features_b[min(selected_level, len(pyramid_features_b)-1)]
-
-            # Resize to Level0 resolution for GRU stability
-            if level_feat_a.shape[-2:] != (H, W):
-                level_feat_a = F.interpolate(level_feat_a, size=(H, W), mode='bilinear', align_corners=True)
-                level_feat_b = F.interpolate(level_feat_b, size=(H, W), mode='bilinear', align_corners=True)
-
-            # Selected feature + difference
-            f_selected = self.extract_feature_by_type(level_feat_a, selected_feature)
-            e_diff_selected = self.extract_feature_by_type(e_diff, selected_feature)
-
-            # 4) Mini-GRU step
-            gru = self.get_gru_by_type(selected_feature)
-            h_prev = hidden_states[selected_feature]
-            if h_prev.shape[-2:] != (H, W):
-                h_prev = F.interpolate(h_prev, size=(H, W), mode='bilinear', align_corners=True)
-
-            h_new, delta_w = gru(h_prev, e_diff_selected, f_selected)
-            hidden_states[selected_feature] = h_new
-
-            # 5) Convergence check (ΔW ≈ I)
-            if self.check_convergence(delta_w):
-                print(f"  [Iter {k+1}] Converged: ΔW ≈ I ✓")
-                break
-
-            # 6) Candidate update (do NOT commit yet)
-            W_candidate = accumulator.compose_from_delta_map(delta_w, step_scale=step_scale)
-
-            # 7) Safety Lock Stage 1: Update Rejection
-            e_pos_next, e_angle_next, _, _ = self.compute_error(
-                pyramid_features_a[0], pyramid_features_b[0], W_candidate
-            )
-            e_next = e_pos_next.mean().item()
-
-            if e_next > e_curr * (1.0 + TOLERANCE_ALPHA):
-                consecutive_rejections += 1
-                print(f"  [Iter {k+1}] Update Rejected: {e_next:.2f}px > {e_curr:.2f}px*(1+{TOLERANCE_ALPHA}) "
-                      f"({consecutive_rejections}/{MAX_CONSECUTIVE_REJECTIONS})")
-
-                # Stage 2: GRU Reset + LR Decay (2회 연속 거부 시)
-                if consecutive_rejections >= 2:
-                    step_scale *= LR_DECAY_FACTOR
-                    # Hidden state reset (전부 0으로)
-                    hidden_states['S'] = self.gru_s.init_hidden(B, H, W, device)
-                    hidden_states['V'] = self.gru_v.init_hidden(B, H, W, device)
-                    hidden_states['B'] = self.gru_b.init_hidden(B, H, W, device)
-                    print(f"  [Recovery] GRU reset + step_scale *= {LR_DECAY_FACTOR} -> {step_scale:.4f}")
-
-                # Stage 3: Emergency Exit
-                if consecutive_rejections >= MAX_CONSECUTIVE_REJECTIONS:
-                    print(f"  [Emergency] Max rejections reached, aborting.")
-                    break
-
-                # Rollback: accumulator는 commit 하지 않았으므로 W_curr 유지
-                continue
-
-            # Accept update
-            accumulator.set_current(W_candidate)
-            consecutive_rejections = 0
-
-            history.append({
-                'iteration': k + 1,
-                'error_px': e_curr,
-                'error_angle': e_angle.mean().item(),
-                'selected_level': selected_level,
-                'selected_feature': selected_feature,
-                'step_scale': step_scale,
-                'error_next_px': e_next
-            })
-
-            print(f"  [Iter {k+1}] Error={e_curr:.1f}px → {e_next:.1f}px | "
-                  f"Level={selected_level} | Feature={selected_feature} | step_scale={step_scale:.3f}")
-
-        W_final = accumulator.get_current()
-        return W_final, history
-
-
-class Phase35Refiner(nn.Module):
-    """Architecture.md §3.5 - Wrapper"""
-    def __init__(self, feature_dim):
-        super().__init__()
-        self.refinement_loop = IterativeRefinementLoop(feature_dim)
-
-    def forward(self, pyramid_features_a, pyramid_features_b, phase3_results=None, device=None):
-        if device is None:
-            device = pyramid_features_a[0].device
-        return self.refinement_loop(pyramid_features_a, pyramid_features_b, phase3_results, device)
-
-
-# =============================================================================
-# 테스트 코드
-# =============================================================================
-if __name__ == "__main__":
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Phase 3.5 ArchFull Test on: {device}")
-
-    B, C, H, W = 1, 144, 64, 64
-
-    pyramid_a = [torch.randn(B, C, H // (2**i), W // (2**i), device=device) for i in range(4)]
-    pyramid_b = [torch.randn(B, C, H // (2**i), W // (2**i), device=device) for i in range(4)]
-
-    refiner = Phase35Refiner(feature_dim=C).to(device)
-
-    with torch.no_grad():
-        W_refined, history = refiner(pyramid_a, pyramid_b, phase3_results=None, device=device)
-
-    print(f"\n[Result]")
-    print(f"  W_refined shape: {W_refined.shape}")
-    print(f"  Iterations: {len(history)}")
-    for h in history:
-        print(f"    Iter {h['iteration']}: {h['error_px']:.1f}px -> {h['error_next_px']:.1f}px "
-              f"| Level={h['selected_level']} Feature={h['selected_feature']} step={h['step_scale']:.3f}")
+            # Phase3의 coarsest global transform을 우선 사용 (B->A theta)
+            init_W = coarse_res.get('W_global', None)
+            if init_W is None:
+                coarse_rotor = coarse_res.get('delta_rotor_map', None)
+                if coarse_rotor is not None:
+                    init_W = self.rotor_map_to_theta(coarse_rotor)
+                else:
+                    init_W = None

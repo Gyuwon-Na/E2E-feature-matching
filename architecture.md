@@ -478,7 +478,7 @@ $$
 
 ---
 
-## **📂 5: 통합 기하학적 손실 함수 (Unified Geometric Loss)**
+## **📂 6: 통합 기하학적 손실 함수 (Unified Geometric Loss)**
 
 모델의 최종 학습 목표는 아래의 **단일 통합 수식**을 최소화하는 것입니다.
 
@@ -551,7 +551,7 @@ $$L_{total} = \alpha \sum_{p \in \Omega} \underbrace{\left( L_{s}(p) + L_{v\_loc
 
 ---
 
-## 📌 6: Code Implementation Notes (v5 / Code-Architecture Sync)
+## 📌 7: Code Implementation Notes (v5 / Code-Architecture Sync)
 
 > 이 섹션은 **architecture.md(개념 설계)** 와 **현재 코드 구현(phase1~phase4_2, losses, fine_tune/fast_finetune)** 사이의 차이를 없애기 위해,  
 > 코드에 존재하지만 본문에 상세히 없던 구현 포인트/하이퍼파라미터를 문서화한 **"Implementation Addendum"** 입니다.
@@ -610,7 +610,7 @@ $$L_{total} = \alpha \sum_{p \in \Omega} \underbrace{\left( L_{s}(p) + L_{v\_loc
 
 ---
 
-## 📌 7: Training & Fine-Tuning Pipeline (fine_tune.py / fast_finetune.py)
+## 📌 8: Training & Fine-Tuning Pipeline (fine_tune.py / fast_finetune.py)
 
 ### 7.1 Dataset: GeometricRotationDataset
 

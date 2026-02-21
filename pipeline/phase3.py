@@ -214,8 +214,8 @@ NUM_ATTENTION_HEADS = 4          # Multi-Head Attention 헤드 수
 SE_REDUCTION = 16                # SE Block 축소 비율
 
 # RTX 3090 메모리 최적화 (기존 코드 유지)
-SAFE_N_LIMIT = 8192              # Chunking 없이 처리할 최대 픽셀 수
-SAFE_ELEMENTS = 2**22            # Chunk당 최대 요소 수 (~400만)
+SAFE_N_LIMIT = 4096              # Chunking 없이 처리할 최대 픽셀 수
+SAFE_ELEMENTS = 2**19            # Chunk당 최대 요소 수 (~400만)
 
 # [Architecture.md 정합] 기본은 "모든 레벨"에서 Cross-Attention 수행
 # (필요 시 사용자가 HIGH_RES_SKIP_LEVEL을 >0 으로 올려 최적화 가능)
@@ -401,14 +401,24 @@ class RotorScaleAttention(nn.Module):
 
         r_mag_v = r_mag.expand(B, self.num_heads, N, 1)
 
+        # NOTE: chunked attention은 내부 루프가 길어져 tqdm 출력이 학습 로그를 오염시킬 수 있습니다.
+        # 기본값은 항상 숨김(quiet)이며, 필요할 때만 환경변수로 켤 수 있게 합니다.
+        #   SHOW_ATTN_CHUNKS=1  -> tqdm 활성화
+        show_attn_chunks = os.getenv("SHOW_ATTN_CHUNKS", "0") == "1"
+
         pbar = tqdm(
             range(0, N, CHUNK_SIZE),
             desc=f"  [Attn] Chunks (N={N})",
             leave=False,
-            disable=(N <= SAFE_N_LIMIT)
+            disable=(not show_attn_chunks)
         )
 
-        with torch.amp.autocast('cuda', enabled=torch.cuda.is_available()):
+        # 이 모듈 내부에서 autocast를 강제로 켜면(=cuda available) dtype이 예기치 않게 fp16으로 고정될 수 있습니다.
+        # outer training loop의 autocast 설정을 그대로 따르도록 변경합니다.
+        autocast_enabled = torch.is_autocast_enabled()
+        device_type = x.device.type
+
+        with torch.amp.autocast(device_type=device_type, enabled=autocast_enabled):
             for i in pbar:
                 q_chunk = q[:, :, i:i + CHUNK_SIZE, :]  # (B,heads,M,hd)
                 r_mag_q = r_mag[:, :, i:i + CHUNK_SIZE, :]  # (B,1,M,1)
@@ -452,7 +462,7 @@ class RotorScaleAttention(nn.Module):
 
                 output_chunks.append(out_chunk)
 
-                del scale_diff, scale_bias, rot_sim, rot_bias, attn_mask, r_mag_att, injection
+                del scale_diff, scale_bias, rot_sim, rot_bias, attn_mask, r_mag_att, injection, out_chunk
 
         out = torch.cat(output_chunks, dim=2)  # (B,heads,N,hd)
         out = out.transpose(1, 2).reshape(B, H, W, C)
@@ -804,6 +814,37 @@ class Phase3Transformer(nn.Module):
         theta[:, 1, 1] = cos_t
         theta[:, 1, 2] = dy_t
         return theta
+    
+    @staticmethod
+    def invert_affine_2x3(theta, eps: float = 1e-8):
+        """
+        Invert 2x3 affine (B,2,3) in normalized coords.
+        If theta maps out -> in, inv(theta) maps in -> out.
+        """
+        # theta = [[a,b,tx],
+        #          [c,d,ty]]
+        a = theta[:, 0, 0]
+        b = theta[:, 0, 1]
+        tx = theta[:, 0, 2]
+        c = theta[:, 1, 0]
+        d = theta[:, 1, 1]
+        ty = theta[:, 1, 2]
+
+        det = a * d - b * c
+        # avoid divide-by-zero
+        det = torch.where(det.abs() < eps, det.sign() * eps, det)
+
+        inv_a =  d / det
+        inv_b = -b / det
+        inv_c = -c / det
+        inv_d =  a / det
+
+        inv_tx = -(inv_a * tx + inv_b * ty)
+        inv_ty = -(inv_c * tx + inv_d * ty)
+
+        row1 = torch.stack([inv_a, inv_b, inv_tx], dim=1)
+        row2 = torch.stack([inv_c, inv_d, inv_ty], dim=1)
+        return torch.stack([row1, row2], dim=1)
 
     @staticmethod
     def compose_theta(delta, prev):
@@ -897,9 +938,10 @@ class Phase3Transformer(nn.Module):
             # -----------------------------
             # 3) Encoder (Self-Attn with rotor tuple)
             # -----------------------------
-            for layer in self.encoder_layers:
-                tok_a = checkpoint(layer, tok_a, rotor_a_warped, use_reentrant=False)
-                tok_b = checkpoint(layer, tok_b, rotor_b, use_reentrant=False)
+            if level_idx >= HIGH_RES_SKIP_LEVEL:
+                for layer in self.encoder_layers:
+                    tok_a = checkpoint(layer, tok_a, rotor_a_warped, use_reentrant=False)
+                    tok_b = checkpoint(layer, tok_b, rotor_b, use_reentrant=False)
 
             # -----------------------------
             # 4) Cross-Attention -> Residual ΔW (dense rotor map)
@@ -952,12 +994,25 @@ class Phase3Transformer(nn.Module):
 
             # 다음 레벨로 전달할 decoder feature
             dec_feat_prev = refined_feature
+            # W_prev는 Phase3 설계상 theta_B2A (out=B -> in=A) 로 누적되는 값
+            theta_B2A = W_prev
+
+            # Loss/Metric용 A->B 로도 같이 제공 (GT w_gt는 A->B)
+            W_AB = self.invert_affine_2x3(theta_B2A)
 
             # 기록
             results.append({
                 'level': level_idx,
                 'delta_rotor_map': delta_rotor,
-                'W_global': W_prev,
+                'g_s': g_s.unsqueeze(1),
+                'g_v': g_v.unsqueeze(1),
+                'g_b': g_b.unsqueeze(1),
+
+                # 명시적으로 방향 표기 (혼동 방지)
+                'W_global': theta_B2A,     # (=B->A, out->in)
+                'W_B2A': theta_B2A,
+                'W_AB': W_AB,             # (=A->B, GT 방향)
+
                 'refined_feature': refined_feature,
                 'mpc_map': mpc_map,
             })
