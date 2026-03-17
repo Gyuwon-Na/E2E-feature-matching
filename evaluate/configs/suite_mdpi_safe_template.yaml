@@ -1,0 +1,42 @@
+dataset:
+  manifest: ../example_data/manifest_smoke.jsonl
+
+runtime:
+  output_dir: ../evaluate_outputs/mdpi_safe
+  checkpoint_root: ../../checkpoints   # 여기 수정
+
+models:
+  - name: loftr_kornia
+    kind: loftr_kornia
+    pretrained: outdoor
+    device: auto
+
+  - name: efficientloftr
+    kind: efficientloftr_hf
+    device: auto
+    model_id: zju-community/efficientloftr
+    processor_model_id: zju-community/efficientloftr
+    local_pretrained_dir: ../../checkpoints/hf/efficientloftr   # 여기 수정
+    local_files_only: true
+    use_fast_processor: false
+    postprocess_threshold: 0.20
+
+  - name: lightglue_superpoint
+    kind: lightglue_hf
+    device: auto
+    model_id: ETH-CVG/lightglue_superpoint
+    processor_model_id: ETH-CVG/lightglue_superpoint
+    local_pretrained_dir: ../../checkpoints/hf/lightglue_superpoint   # 여기 수정
+    local_files_only: true
+    use_fast_processor: false
+    postprocess_threshold: 0.20
+
+  - name: superglue_outdoor
+    kind: superglue_hf
+    device: auto
+    model_id: magic-leap-community/superglue_outdoor
+    processor_model_id: magic-leap-community/superglue_outdoor
+    local_pretrained_dir: ../../checkpoints/hf/superglue_outdoor   # 여기 수정
+    local_files_only: true
+    use_fast_processor: false
+    postprocess_threshold: 0.20

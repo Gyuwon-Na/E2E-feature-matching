@@ -12,7 +12,7 @@ Checkpoint Fusion & Self-Evaluation Visualization
     python eval_self.py --mode fuse --ckpt1 angle_best.pth --ckpt2 pixel_best.pth
     
     # Self-Evaluation 시각화
-    python eval_self.py --mode visualize --checkpoint best_model.pth --data_dir ./val2017
+    python eval_self.py --mode visualize --checkpoint v5_60deg_last_model.pth --data_dir ./val2017
 ================================================================================
 """
 
@@ -624,7 +624,7 @@ class SelfEvaluationVisualizer:
         배치 평가 및 통계 시각화
         """
         if angles is None:
-            angles = [-20, -15, -10, -5, 0, 5, 10, 15, 20]
+            angles = [-15, -10, -5, 0, 5, 10, 15]
         
         img_paths = list(Path(img_dir).glob('*.jpg')) + list(Path(img_dir).glob('*.png'))
         if not img_paths:
@@ -753,7 +753,7 @@ def main():
                         default='performance', help='Fusion method')
     
     # Visualization arguments
-    parser.add_argument('--checkpoint', type=str, default='./checkpoints/best_model.pth',
+    parser.add_argument('--checkpoint', type=str, default='./checkpoints/v5_60deg_last_model.pth',
                         help='Model checkpoint for visualization')
     parser.add_argument('--data_dir', type=str, default='./val2017',
                         help='Image directory')

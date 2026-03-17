@@ -1,0 +1,38 @@
+{
+  "architectures": [
+    "LightGlueForKeypointMatching"
+  ],
+  "attention_bias": true,
+  "attention_dropout": 0.0,
+  "depth_confidence": 0.95,
+  "descriptor_dim": 256,
+  "filter_threshold": 0.1,
+  "hidden_act": "gelu",
+  "hidden_size": 256,
+  "initializer_range": 0.02,
+  "intermediate_size": 512,
+  "keypoint_detector_config": {
+    "border_removal_distance": 4,
+    "decoder_hidden_size": 256,
+    "descriptor_decoder_dim": 256,
+    "encoder_hidden_sizes": [
+      64,
+      64,
+      128,
+      128
+    ],
+    "initializer_range": 0.02,
+    "keypoint_decoder_dim": 65,
+    "keypoint_threshold": 0.005,
+    "max_keypoints": -1,
+    "model_type": "superpoint",
+    "nms_radius": 4
+  },
+  "model_type": "lightglue",
+  "num_attention_heads": 4,
+  "num_hidden_layers": 9,
+  "num_key_value_heads": 4,
+  "torch_dtype": "float32",
+  "transformers_version": "4.53.0.dev0",
+  "width_confidence": 0.99
+}

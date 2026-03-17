@@ -1,0 +1,12 @@
+{
+  "do_grayscale": true,
+  "do_rescale": true,
+  "do_resize": true,
+  "image_processor_type": "LightGlueImageProcessor",
+  "resample": 2,
+  "rescale_factor": 0.00392156862745098,
+  "size": {
+    "height": 480,
+    "width": 640
+  }
+}
