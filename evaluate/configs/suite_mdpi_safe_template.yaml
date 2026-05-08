@@ -1,5 +1,5 @@
 dataset:
-  manifest: ../example_data/manifest_smoke.jsonl
+  manifest: ../../eval_data_synth/manifest.jsonl
 
 runtime:
   output_dir: ../evaluate_outputs/mdpi_safe
@@ -40,3 +40,16 @@ models:
     local_files_only: true
     use_fast_processor: false
     postprocess_threshold: 0.20
+  
+  - name: my_clifford_e2e
+    kind: user_custom_callable
+    device: auto
+    factory: my_clifford_adapter:build_model
+    predictor: my_clifford_adapter:predict_sample
+    checkpoint: ../../checkpoints/rot92_1.82.pth
+    factory_kwargs:
+      package_root: ../../E2E-feature-matching
+      hidden_dim: 48
+      feature_dim: 144
+      phase_levels: 5
+      use_refiner: false

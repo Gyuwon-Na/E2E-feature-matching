@@ -1,0 +1,35 @@
+dataset:
+  manifest: ../../eval_data_synth/manifest.jsonl
+
+runtime:
+  output_dir: ../evaluate_outputs/mdpi_safe
+  checkpoint_root: ../../checkpoints
+  fail_fast: false
+
+metrics:
+  pck_thresholds: [1, 3, 5]
+  homography_fit:
+    method: usac_magsac
+    ransac_reproj_threshold: 3.0
+    max_iters: 10000
+    confidence: 0.999
+    max_fit_points: 5000
+  rotation:
+    metric: alignment_error_px
+    bins: [0, 5, 15, 30, 60, 90, 180]
+  stage_pairs:
+    - [after_transformer, final]
+
+models:
+  - name: my_clifford_e2e
+    kind: user_custom_callable
+    device: auto
+    factory: my_clifford_adapter:build_model
+    predictor: my_clifford_adapter:predict_sample
+    checkpoint: ../../checkpoints/rot92_1.82.pth
+    factory_kwargs:
+      package_root: ../../E2E-feature-matching
+      hidden_dim: 48
+      feature_dim: 144
+      phase_levels: 5
+      use_refiner: false

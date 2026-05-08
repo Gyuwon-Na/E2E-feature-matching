@@ -11,6 +11,13 @@ from ..utils import get_package_version, to_device
 from .base import BaseMatcher
 
 
+def _to_numpy(x):
+    import torch
+    if isinstance(x, torch.Tensor):
+        return x.detach().cpu().numpy()
+    return np.asarray(x)
+
+
 class HFKeypointMatcher(BaseMatcher):
     min_transformers_version = "4.0.0"
     default_model_id: str = ""
@@ -138,9 +145,14 @@ class HFKeypointMatcher(BaseMatcher):
             target_sizes,
             threshold=float(self.config.get("postprocess_threshold", 0.2)),
         )[0]
-        kpts0 = np.asarray(processed["keypoints0"], dtype=np.float64)
-        kpts1 = np.asarray(processed["keypoints1"], dtype=np.float64)
-        scores = np.asarray(processed.get("matching_scores", np.ones((kpts0.shape[0],), dtype=np.float64)), dtype=np.float64)
+        kpts0 = _to_numpy(processed["keypoints0"]).astype(np.float64, copy=False)
+        kpts1 = _to_numpy(processed["keypoints1"]).astype(np.float64, copy=False)
+
+        raw_scores = processed.get("matching_scores")
+        if raw_scores is None:
+            scores = np.ones((kpts0.shape[0],), dtype=np.float64)
+        else:
+            scores = _to_numpy(raw_scores).astype(np.float64, copy=False).reshape(-1)
         return PredictionBundle(
             sparse=SparseCorrespondence(matches0=kpts0, matches1=kpts1, confidence=scores),
             extras=dict(self.extras),
