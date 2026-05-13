@@ -7,12 +7,14 @@ number of recurrent residual updates. The design is intentionally conservative:
 - internal transform convention: B -> A theta for affine_grid/grid_sample
 - initialization: prefer Phase 3 finest accumulated transform, then fall back
   to coarser levels only when the finest result is missing or invalid
-- routing: choose a pyramid level from the current position error, then choose
-  one S/V/B branch from position / angular / bivector residuals
-- priors: use Phase 3 gate maps as feature-selection priors when they are
-  available
-- safety: reject clearly divergent updates, reset hidden state after repeated
-  rejections, and decay the step scale before aborting
+- routing: compute the paper-style controller score J_k from S/V/B residuals
+  and soft Phase-3 gate priors, then choose both the operating pyramid level
+  and one S/V/B branch
+- priors: use Phase 3 gate maps through soft controller weights so that no
+  stream is completely suppressed by a low prior
+- safety: evaluate candidate updates with position, angular, bivector, and
+  J_k diagnostics; reject non-improving/divergent proposals, reset hidden
+  state after repeated rejections, and decay the step scale before aborting
 
 The module keeps the public class names used by the existing training script.
 """
@@ -36,20 +38,41 @@ NUM_ITERATIONS = 4
 
 GRU_HIDDEN_DIM = 16
 
-# Level Selection thresholds (px)
+# Legacy position-only thresholds are kept for external compatibility.
+# Internally, Phase 4 now selects the operating level from the paper's
+# controller score J_k instead of from e_pos alone.
 LEVEL_THRESHOLD_HIGH = 30
 LEVEL_THRESHOLD_MID = 10
 LEVEL_THRESHOLD_LOW = 5
 
-# Feature Selection thresholds (Architecture.md: [10.0, 0.1])
+# Paper Eq. (54): level selection thresholds for the controller score J_k.
+LEVEL_SCORE_HIGH = 2.50
+LEVEL_SCORE_MID = 1.50
+LEVEL_SCORE_LOW = 0.75
+
+# Feature Selection thresholds (Architecture.md / paper §3.4)
 FEATURE_POS_THRESHOLD = 10.0      # px
-FEATURE_ANGLE_THRESHOLD = 0.1     # rad (~5.7°)
+FEATURE_ANGLE_THRESHOLD = 0.1     # cosine-distance angular mismatch
 FEATURE_B_THRESHOLD = 0.08        # bivector / rotor residual (heuristic)
+FEATURE_ANGLE_FALLBACK_THRESHOLD = 0.06
+FEATURE_B_DOMINANCE_MARGIN = 1.15
 
 # Convergence & Target
 CONVERGENCE_THRESHOLD = 0.005
 TARGET_ERROR_PX = 3.0
+# Paper Eq. (63): stop only when position, angular, rotor residuals, and J_k
+# are all small. This avoids a position-only early exit.
+TARGET_ANGLE_ERROR = 0.08
+TARGET_B_ERROR = 0.06
+TARGET_CONTROLLER_SCORE = 0.55
 TOLERANCE_ALPHA = 0.05
+
+# Paper Eqs. (64)-(65): safety/acceptance thresholds.
+POS_REJECT_RATIO = 1.15
+ANGLE_REJECT_RATIO = 1.20
+B_REJECT_RATIO = 1.15
+ACCEPT_ANGLE_IMPROVE_RATIO = 0.90
+ACCEPT_RESIDUAL_TOL = 1.05
 
 # Safety Lock
 MAX_CONSECUTIVE_REJECTIONS = 3
@@ -155,55 +178,171 @@ class ErrorDiagnostic(nn.Module):
 # =============================================================================
 
 class DualAdaptiveSelector(nn.Module):
-    """Choose a level from the current error scale and a feature branch from
-    position / angular / bivector residuals. Gate priors from Phase 3 act as a
-    multiplicative bias instead of a hard override."""
-    def select_level(self, e_pos):
-        avg_error = e_pos.mean().item()
-        if avg_error > LEVEL_THRESHOLD_HIGH:
+    """Paper-aligned dual-adaptive controller.
+
+    The selector does not choose the already-best-matching stream. It routes the
+    next GRU update toward the largest *reliable* residual stream. Reliability is
+    injected through the soft gate-prior weight
+
+        w(pi) = 0.5 * clip(pi, 1e-3, 1.0) + 0.5,
+
+    which follows the paper and avoids fully suppressing any S/V/B stream.
+    """
+    @staticmethod
+    def _to_float(value, default=1.0):
+        if value is None:
+            return float(default)
+        if torch.is_tensor(value):
+            return float(value.detach().mean().item())
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return float(default)
+
+    @classmethod
+    def soft_prior(cls, value):
+        """[Phase4-PAPER-CTRL] Soft prior w(pi), not direct prior multiplication."""
+        prior = cls._to_float(value, default=1.0)
+        prior = float(np.clip(prior, 1e-3, 1.0))
+        return 0.5 * prior + 0.5
+
+    @staticmethod
+    def summarize_residuals(e_pos, e_angle, e_b):
+        return {
+            'pos': e_pos.mean().item(),
+            'angle': e_angle.mean().item(),
+            'b': e_b.mean().item(),
+        }
+
+    def normalized_scores_from_values(self, avg_pos, avg_angle, avg_b, gate_priors=None):
+        """Return normalized q_S, q_V, q_B and the soft weights used to form them."""
+        if gate_priors is None:
+            gate_priors = {'S': 1.0, 'V': 1.0, 'B': 1.0}
+
+        # [Phase4-PAPER-CTRL] Paper uses soft controller weights, so a low gate
+        # prior cannot completely suppress an otherwise useful residual stream.
+        weight_s = self.soft_prior(gate_priors.get('S', 1.0))
+        weight_v = self.soft_prior(gate_priors.get('V', 1.0))
+        weight_b = self.soft_prior(gate_priors.get('B', gate_priors.get('R', 1.0)))
+
+        scores = {
+            'S': weight_s * (avg_pos / max(FEATURE_POS_THRESHOLD, 1e-6)),
+            'V': weight_v * (avg_angle / max(FEATURE_ANGLE_THRESHOLD, 1e-6)),
+            'B': weight_b * (avg_b / max(FEATURE_B_THRESHOLD, 1e-6)),
+        }
+        weights = {'S': weight_s, 'V': weight_v, 'B': weight_b}
+        return scores, weights
+
+    def normalized_scores(self, e_pos, e_angle, e_b, gate_priors=None):
+        """Return q_S, q_V, q_B using paper-style residual normalization."""
+        residuals = self.summarize_residuals(e_pos, e_angle, e_b)
+        scores, _ = self.normalized_scores_from_values(
+            residuals['pos'], residuals['angle'], residuals['b'], gate_priors
+        )
+        return scores['S'], scores['V'], scores['B']
+
+    def component_scores(self, e_pos, e_angle, e_b, gate_priors=None):
+        residuals = self.summarize_residuals(e_pos, e_angle, e_b)
+        scores, weights = self.normalized_scores_from_values(
+            residuals['pos'], residuals['angle'], residuals['b'], gate_priors
+        )
+        return scores, weights, residuals
+
+    def controller_score(self, e_pos, e_angle, e_b, gate_priors=None):
+        """Paper Eq. (54): J_k = q_S + q_V + q_B on the finest grid."""
+        scores, weights, residuals = self.component_scores(e_pos, e_angle, e_b, gate_priors)
+        J = scores['S'] + scores['V'] + scores['B']
+        return J, scores, weights, residuals
+
+    @staticmethod
+    def select_level_from_score(controller_score):
+        """[Phase4-PAPER-CTRL] Eq. (54) level selection from J_k."""
+        J_k = float(controller_score)
+        if J_k > LEVEL_SCORE_HIGH:
             return 3
-        elif avg_error > LEVEL_THRESHOLD_MID:
+        elif J_k > LEVEL_SCORE_MID:
             return 2
-        elif avg_error > LEVEL_THRESHOLD_LOW:
+        elif J_k > LEVEL_SCORE_LOW:
             return 1
         else:
             return 0
 
-    def select_feature(self, e_pos, e_angle, e_b, gate_priors=None):
-        """Architecture.md §3.5 - Feature Selection
+    def select_level(self, e_pos, e_angle=None, e_b=None, gate_priors=None):
+        """Choose level from J_k when all residuals are supplied.
 
-        기존 로직은 (pos, angle)만으로 B를 선택했기 때문에,
-        explicit GP가 바꿔 놓은 B-stream 분포를 제대로 반영하지 못했습니다.
-        여기서는 실제 bivector residual(e_b)을 함께 사용하고,
-        Phase3가 노출한 pure gate prior를 점수에 곱해
-        현재 레벨에서 더 신뢰할 만한 성분이 우선 선택되도록 보강합니다.
+        The position-only path is intentionally kept for old/debug callers, but
+        the Phase 4 forward loop calls this with e_pos/e_angle/e_b and fine-level
+        gate priors so the paper's J_k controller is used.
         """
-        avg_pos = e_pos.mean().item()
-        avg_angle = e_angle.mean().item()
-        avg_b = e_b.mean().item()
+        if e_angle is None or e_b is None:
+            avg_error = e_pos.mean().item()
+            if avg_error > LEVEL_THRESHOLD_HIGH:
+                return 3
+            elif avg_error > LEVEL_THRESHOLD_MID:
+                return 2
+            elif avg_error > LEVEL_THRESHOLD_LOW:
+                return 1
+            else:
+                return 0
 
-        if gate_priors is None:
-            gate_priors = {'S': 1.0, 'V': 1.0, 'B': 1.0}
+        J, _, _, _ = self.controller_score(e_pos, e_angle, e_b, gate_priors=gate_priors)
+        return self.select_level_from_score(J)
 
-        prior_s = float(np.clip(gate_priors.get('S', 1.0), 1e-3, 1.0))
-        prior_v = float(np.clip(gate_priors.get('V', 1.0), 1e-3, 1.0))
-        prior_b = float(np.clip(gate_priors.get('B', 1.0), 1e-3, 1.0))
+    def select_feature(self, e_pos, e_angle, e_b, gate_priors=None):
+        """Paper §3.4 stream selection with soft priors and angular fallback.
 
-        score_s = (avg_pos / max(FEATURE_POS_THRESHOLD, 1e-6)) * prior_s
-        score_v = (avg_angle / max(FEATURE_ANGLE_THRESHOLD, 1e-6)) * prior_v
-        score_b = (avg_b / max(FEATURE_B_THRESHOLD, 1e-6)) * prior_b
+        The scores select the stream that is both mismatched and reliable:
+        - B/Rstr first when q_B is dominant and the B residual is above threshold.
+        - S when the normalized position residual dominates V and is above threshold.
+        - V when the angular residual is clearly above threshold.
+        - V fallback when angular mismatch remains non-negligible, position is
+          already acceptable, and B is not clearly dominant.
+        - B/Rstr otherwise as the final low-residual corrective stream.
+        """
+        scores, _, residuals = self.component_scores(e_pos, e_angle, e_b, gate_priors)
+        avg_pos = residuals['pos']
+        avg_angle = residuals['angle']
+        avg_b = residuals['b']
 
-        if (score_b >= score_s) and (score_b >= score_v) and (avg_b > FEATURE_B_THRESHOLD):
+        score_s = scores['S']
+        score_v = scores['V']
+        score_b = scores['B']
+
+        b_is_dominant = (score_b >= score_s) and (score_b >= score_v)
+        if b_is_dominant and (avg_b > FEATURE_B_THRESHOLD):
             return 'B'
         elif (score_s >= score_v) and (avg_pos > FEATURE_POS_THRESHOLD):
             return 'S'
         elif avg_angle > FEATURE_ANGLE_THRESHOLD:
             return 'V'
+        elif (
+            avg_angle > FEATURE_ANGLE_FALLBACK_THRESHOLD
+            and avg_pos < FEATURE_POS_THRESHOLD
+            and score_b < FEATURE_B_DOMINANCE_MARGIN * score_v
+        ):
+            # [Phase4-PAPER-CTRL] Paper fallback: keep using V when angular
+            # mismatch remains, S is already within tolerance, and B/Rstr is not
+            # clearly dominant.
+            return 'V'
         else:
             return 'B'
 
-    def forward(self, e_pos, e_angle, e_b, gate_priors=None):
-        return self.select_level(e_pos), self.select_feature(e_pos, e_angle, e_b, gate_priors=gate_priors)
+    def forward(self, e_pos, e_angle, e_b, gate_priors=None, fine_gate_priors=None, level_gate_priors=None):
+        """Return level, feature, and J_k.
+
+        `gate_priors` is kept for backward-compatible callers that used the old
+        single-prior argument.  The main loop passes `fine_gate_priors` for J_k
+        and `level_gate_priors` for stream selection.
+        """
+        if fine_gate_priors is None:
+            fine_gate_priors = gate_priors
+        if level_gate_priors is None:
+            level_gate_priors = gate_priors
+
+        J_k, _, _, _ = self.controller_score(e_pos, e_angle, e_b, gate_priors=fine_gate_priors)
+        selected_level = self.select_level_from_score(J_k)
+        selected_feature = self.select_feature(e_pos, e_angle, e_b, gate_priors=level_gate_priors)
+        return selected_level, selected_feature, J_k
 
 
 # =============================================================================
@@ -570,19 +709,47 @@ class IterativeRefinementLoop(nn.Module):
         for k in range(NUM_ITERATIONS):
             W_curr = accumulator.get_current()
 
-            # 1) Current error (Level0)
+            # 1) Current residual diagnostics on the finest operating grid.
             e_pos, e_angle, e_b, e_diff, feat_a_warped = self.compute_error(
                 pyramid_features_a[0], pyramid_features_b[0], W_curr
             )
-            e_curr = e_pos.mean().item()
+            avg_pos = e_pos.mean().item()
+            avg_angle = e_angle.mean().item()
+            avg_b = e_b.mean().item()
+            e_curr = avg_pos  # kept for backward-compatible logging / history key names
 
-            # 2) Target reached
-            if e_curr < TARGET_ERROR_PX:
-                print(f"  [Iter {k+1}] Target reached: {e_curr:.2f}px < {TARGET_ERROR_PX}px OK")
+            # [Phase4-PAPER-CTRL] Paper Eq. (54): J_k uses finest-level gate
+            # priors and all three S/V/B residuals instead of using e_pos alone.
+            fine_gate_priors = self.get_feature_gate_priors(
+                phase3_results,
+                level_idx=0,
+                target_hw=(H, W),
+            )
+            j_curr, fine_scores, fine_weights, _ = self.selector.controller_score(
+                e_pos, e_angle, e_b, gate_priors=fine_gate_priors
+            )
+
+            # 2) Target reached.
+            # [Phase4-PAPER-CTRL] Paper Eq. (63): do not stop only because the
+            # scalar/position residual is small; angular, rotor-related, and
+            # total controller residuals must also be below their tolerances.
+            if (
+                avg_pos < TARGET_ERROR_PX
+                and avg_angle < TARGET_ANGLE_ERROR
+                and avg_b < TARGET_B_ERROR
+                and j_curr < TARGET_CONTROLLER_SCORE
+            ):
+                print(
+                    f"  [Iter {k+1}] Target reached: "
+                    f"pos={avg_pos:.2f}px, angle={avg_angle:.4f}, "
+                    f"B={avg_b:.4f}, J={j_curr:.4f} OK"
+                )
                 break
 
-            # 3) Dual selection (이제 B residual도 함께 사용)
-            selected_level = self.selector.select_level(e_pos)
+            # 3) Dual selection.
+            # [Phase4-PAPER-CTRL] Select level from J_k, then select the stream
+            # from q_S/q_V/q_B computed with the selected level's gate priors.
+            selected_level = self.selector.select_level_from_score(j_curr)
             level_idx = min(selected_level, len(pyramid_features_a)-1)
 
             level_feat_a = pyramid_features_a[level_idx]
@@ -595,6 +762,9 @@ class IterativeRefinementLoop(nn.Module):
                 target_hw=(H_lvl, W_lvl),
             )
             selected_feature = self.selector.select_feature(e_pos, e_angle, e_b, gate_priors=gate_priors)
+            score_s, score_v, score_b = self.selector.normalized_scores(
+                e_pos, e_angle, e_b, gate_priors=gate_priors
+            )
 
             # 선택된 레벨에서 현재 W로 다시 워핑하여 level-aware residual을 계산
             level_feat_a_warped, valid_mask_level = self.warp_features(
@@ -629,23 +799,53 @@ class IterativeRefinementLoop(nn.Module):
             # 6) Candidate update (do NOT commit yet)
             W_candidate = accumulator.compose_from_delta_map(delta_w, step_scale=step_scale)
 
-            # 7) Safety Lock Stage 1: Update Rejection
+            # 7) Safety Lock Stage 1: paper-aligned update rejection / acceptance.
             e_pos_next, e_angle_next, e_b_next, _, _ = self.compute_error(
                 pyramid_features_a[0], pyramid_features_b[0], W_candidate
             )
             e_next = e_pos_next.mean().item()
-
-            # B residual이 급격히 악화되는 경우도 rejection 신호에 반영
-            avg_b = e_b.mean().item()
+            avg_angle_next = e_angle_next.mean().item()
             avg_b_next = e_b_next.mean().item()
-            b_diverged = avg_b_next > avg_b * (1.0 + TOLERANCE_ALPHA)
+            j_next, _, _, _ = self.selector.controller_score(
+                e_pos_next, e_angle_next, e_b_next, gate_priors=fine_gate_priors
+            )
 
-            if (e_next > e_curr * (1.0 + TOLERANCE_ALPHA)) or b_diverged:
+            # [Phase4-PAPER-CTRL] Paper Eq. (64): hard reject if any residual
+            # increases too strongly.  This extends the old position/B-only check
+            # with angular residual and uses the paper's 15/20/15% margins.
+            pos_diverged = e_next > avg_pos * POS_REJECT_RATIO
+            angle_diverged = avg_angle_next > avg_angle * ANGLE_REJECT_RATIO
+            b_diverged = avg_b_next > avg_b * B_REJECT_RATIO
+            hard_reject = pos_diverged or angle_diverged or b_diverged
+
+            # [Phase4-PAPER-CTRL] Paper Eq. (65): otherwise accept only if the
+            # global controller score improves, or if angular mismatch improves
+            # by at least 10% without degrading S/B residuals by more than 5%.
+            accepted_by_score = j_next < j_curr
+            accepted_by_angle = (
+                avg_angle_next < ACCEPT_ANGLE_IMPROVE_RATIO * avg_angle
+                and e_next <= ACCEPT_RESIDUAL_TOL * avg_pos
+                and avg_b_next <= ACCEPT_RESIDUAL_TOL * avg_b
+            )
+            should_accept = (not hard_reject) and (accepted_by_score or accepted_by_angle)
+
+            if not should_accept:
                 consecutive_rejections += 1
+                reject_reasons = []
+                if pos_diverged:
+                    reject_reasons.append('pos')
+                if angle_diverged:
+                    reject_reasons.append('angle')
+                if b_diverged:
+                    reject_reasons.append('B')
+                if not reject_reasons:
+                    reject_reasons.append('no-J/angle-improvement')
                 print(
-                    f"  [Iter {k+1}] Update Rejected: "
-                    f"pos {e_next:.2f}px vs {e_curr:.2f}px, "
-                    f"b {avg_b_next:.4f} vs {avg_b:.4f} "
+                    f"  [Iter {k+1}] Update Rejected ({'+'.join(reject_reasons)}): "
+                    f"pos {e_next:.2f}px vs {avg_pos:.2f}px, "
+                    f"angle {avg_angle_next:.4f} vs {avg_angle:.4f}, "
+                    f"B {avg_b_next:.4f} vs {avg_b:.4f}, "
+                    f"J {j_next:.4f} vs {j_curr:.4f} "
                     f"({consecutive_rejections}/{MAX_CONSECUTIVE_REJECTIONS})"
                 )
 
@@ -675,21 +875,34 @@ class IterativeRefinementLoop(nn.Module):
                 'error_px': e_curr,
                 'error_angle': e_angle.mean().item(),
                 'error_b': avg_b,
+                'controller_score': j_curr,
                 'selected_level': level_idx,
                 'selected_level_request': selected_level,
                 'selected_feature': selected_feature,
                 'gate_prior_s': gate_priors.get('S', 1.0),
                 'gate_prior_v': gate_priors.get('V', 1.0),
                 'gate_prior_b': gate_priors.get('B', 1.0),
+                'soft_weight_s': self.selector.soft_prior(gate_priors.get('S', 1.0)),
+                'soft_weight_v': self.selector.soft_prior(gate_priors.get('V', 1.0)),
+                'soft_weight_b': self.selector.soft_prior(gate_priors.get('B', gate_priors.get('R', 1.0))),
+                'score_s': score_s,
+                'score_v': score_v,
+                'score_b': score_b,
                 'step_scale': step_scale,
                 'error_next_px': e_next,
+                'error_next_angle': avg_angle_next,
                 'error_next_b': avg_b_next,
+                'controller_score_next': j_next,
+                'accepted_by_score': accepted_by_score,
+                'accepted_by_angle': accepted_by_angle,
             })
 
             print(
                 f"  [Iter {k+1}] "
-                f"Error={e_curr:.1f}px → {e_next:.1f}px | "
+                f"Pos={avg_pos:.1f}px → {e_next:.1f}px | "
+                f"Ang={avg_angle:.4f} → {avg_angle_next:.4f} | "
                 f"B={avg_b:.4f} → {avg_b_next:.4f} | "
+                f"J={j_curr:.4f} → {j_next:.4f} | "
                 f"Level={selected_level} | Feature={selected_feature} | step_scale={step_scale:.3f}"
             )
 
